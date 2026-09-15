@@ -1,0 +1,23 @@
+# Built development folders
+.gradle/
+build/
+app/build/
+
+# Android Studio / IntelliJ IDEA generated files
+.idea/
+*.iml
+*.iws
+*.ipr
+local.properties
+.kotlin/
+
+# Gradle signing and secrets
+signing.properties
+secrets.properties
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
