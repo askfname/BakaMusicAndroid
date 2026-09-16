@@ -3,16 +3,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <application
+        android:name=".BakaApplication"
         android:theme="@style/Theme.BakaMusic"
         android:label="Baka Music"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
-        <activity android:name=".MainActivity" android:exported="true" android:configChanges="uiMode|orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density">
+        <activity android:name=".ui.MainActivity" android:exported="true" android:configChanges="uiMode|orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
         </activity>
-        <activity android:name=".SettingsActivity" android:exported="false" android:configChanges="uiMode|orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density" />
-        <service android:name=".PlaybackService" android:exported="true" android:foregroundServiceType="mediaPlayback" android:permission="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK">
+        <activity android:name=".ui.SettingsActivity" android:exported="false" android:configChanges="uiMode|orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density" />
+        <service android:name=".service.PlaybackService" android:exported="true" android:foregroundServiceType="mediaPlayback" android:permission="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK">
             <intent-filter><action android:name="androidx.media3.session.MediaSessionService" /></intent-filter>
         </service>
     </application>
