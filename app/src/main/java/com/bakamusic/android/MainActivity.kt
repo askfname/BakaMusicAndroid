@@ -8,12 +8,21 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
+import coil.compose.rememberAsyncImagePainter
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -36,6 +45,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -440,15 +450,20 @@ class MainActivity : ComponentActivity() {
                     onPlayMedia = ::playMediaItem,
                     onOpenPlaylist = { playlistSheet = it },
                     onImportPlaylist = { importNotice = true },
-                    onSettings = { context.startActivity(Intent(context, SettingsActivity::class.java)) }
+                    onSettings = { context.startActivity(Intent(context, SettingsActivity::class.java)) },
+                    onInstallPlugin = {
+                        val intent = Intent(context, SettingsActivity::class.java)
+                        intent.putExtra(SettingsActivity.EXTRA_SCROLL_TO_PLUGIN, true)
+                        context.startActivity(intent)
+                    }
                 )
             }
             MiniPlayer(
                 now = nowPlaying, playing = playing, buffering = buffering,
+                positionMs = positionMs, durationMs = durationMs,
                 onPrev = { stepPrev() },
                 onToggle = { onTogglePlay() },
                 onNext = { stepNext() },
-                onOpenQueue = { showQueue = true; expanded = true },
                 onOpenPlayer = { showQueue = false; expanded = true }
             )
         }
@@ -604,10 +619,12 @@ class MainActivity : ComponentActivity() {
     onPlayMedia: (MediaItem, List<MediaItem>) -> Unit,
     onOpenPlaylist: (String) -> Unit,
     onImportPlaylist: () -> Unit,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    onInstallPlugin: () -> Unit
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     val repository = remember { AppRepository(context.applicationContext) }
     val scope = rememberCoroutineScope()
     var query by rememberSaveable { mutableStateOf("") }
@@ -622,10 +639,11 @@ class MainActivity : ComponentActivity() {
     var pluginSongs by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
     var searchError by remember { mutableStateOf<String?>(null) }
     var searching by remember { mutableStateOf(false) }
-    // 搜索分页状态：滑到底部 page+1 追加
+    // 搜索分页状态：滑到底部 page+1 追加；分页失败走独立的底部提示，不复用顶部 searchError
     var searchPage by remember { mutableStateOf(1) }
     var searchIsEnd by remember { mutableStateOf(true) }
     var loadingMore by remember { mutableStateOf(false) }
+    var loadMoreError by remember { mutableStateOf<String?>(null) }
     var qualityDialog by remember { mutableStateOf<MediaItem?>(null) }
     var playlistDialog by remember { mutableStateOf<MediaItem?>(null) }
     var downloadError by remember { mutableStateOf<String?>(null) }
@@ -641,6 +659,8 @@ class MainActivity : ComponentActivity() {
     // 无封面歌曲的后台回填任务，随榜单切换取消
     var coverFillJob by remember { mutableStateOf<Job?>(null) }
     val listState = rememberLazyListState()
+    // UI 可用插件（启用中）为空时统一显示安装引导；搜索首页/分页据此保持一致
+    val hasNoPlugin = sourcesLoaded && sources.isEmpty()
     suspend fun reloadSources() {
         // 先重载运行时，再读最新注册表展示音源芯片
         runCatching { sourceService.refresh() }
@@ -673,22 +693,32 @@ class MainActivity : ComponentActivity() {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    LaunchedEffect(submittedQuery, selectedSourcePlatform, sourcesLoaded, searchNonce) {
-        if (submittedQuery.isBlank()) { pluginSongs = emptyList(); searchError = null; return@LaunchedEffect }
+    LaunchedEffect(submittedQuery, selectedSourcePlatform, sourcesLoaded, searchNonce, sources) {
+        if (submittedQuery.isBlank()) { pluginSongs = emptyList(); searchError = null; loadMoreError = null; searchPage = 1; searchIsEnd = true; return@LaunchedEffect }
         if (!sourcesLoaded) return@LaunchedEffect
         if (sources.isEmpty()) {
             reloadSources()
         }
+        // 新一轮首页搜索先复位分页与报错：插件安装返回后旧分页状态不再与新结果叠加
+        searchPage = 1
+        searchIsEnd = true
+        loadMoreError = null
+        searchError = null
         searching = true
         val targetPlatform = selectedSourcePlatform ?: sources.firstOrNull()?.name
         if (sources.isEmpty() || targetPlatform == null) {
             searching = false
-            searchError = "暂无可用音源插件，请到设置 - 插件管理安装"
+            pluginSongs = emptyList()
+            searchError = null
             return@LaunchedEffect
         }
-        // 按当前选中音源搜索，结果整体替换
+        // 先加载运行时再使用：searchByPlatform 内部 ensureLoaded 串行等待重载完成
+        val querySnapshot = submittedQuery
+        val platformSnapshot = selectedSourcePlatform
         try {
             val page = sourceService.searchByPlatform(targetPlatform, submittedQuery)
+            // 查询/音源已变则丢弃晚到结果
+            if (querySnapshot != submittedQuery || platformSnapshot != selectedSourcePlatform) return@LaunchedEffect
             pluginSongs = page.data
             searchPage = 1
             searchIsEnd = page.isEnd || page.data.isEmpty()
@@ -696,8 +726,15 @@ class MainActivity : ComponentActivity() {
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
+            if (querySnapshot != submittedQuery || platformSnapshot != selectedSourcePlatform) return@LaunchedEffect
             pluginSongs = emptyList()
-            searchError = error.message ?: "音源搜索失败"
+            // 无插件由安装引导统一承载，不再显示旧条幅
+            searchError = if (isNoPluginError(error)) {
+                if (sources.isEmpty()) null else "音源插件加载中，请稍后重试"
+            } else {
+                error.message ?: "音源搜索失败"
+            }
+            searchIsEnd = true
         } finally {
             searching = false
         }
@@ -787,12 +824,16 @@ class MainActivity : ComponentActivity() {
             if (platform == dailyPlatform && board == dailyBoard) dailyLoading = false
         }
     }
-    // 滑到底部自动加载下一页并追加
+    // 滑到底部自动加载下一页并追加：无插件时直接停掉，不再产生“加载下一页失败”条幅
     fun loadMore() {
-        if (loadingMore || searching || searchIsEnd || submittedQuery.isBlank() || !sourcesLoaded) return
+        if (loadingMore || searching || searchIsEnd || submittedQuery.isBlank() || !sourcesLoaded || hasNoPlugin) return
+        if (sources.isEmpty()) return
         if (searchPage >= 50) { searchIsEnd = true; return }
         val target = selectedSourcePlatform ?: sources.firstOrNull()?.name ?: return
+        // 目标音源已不在可用列表时不再翻页，避免用过期适配器请求
+        if (sources.none { it.name == target }) return
         loadingMore = true
+        loadMoreError = null
         val q = submittedQuery
         val p = selectedSourcePlatform
         val next = searchPage + 1
@@ -808,7 +849,14 @@ class MainActivity : ComponentActivity() {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                searchError = "加载下一页失败：${error.message ?: "网络异常"}"
+                if (q != submittedQuery || p != selectedSourcePlatform) return@launch
+                // 安装引导覆盖无插件情形：停掉自动翻页且不弹顶部条幅；其余失败只在底部展示并支持重试
+                if (sources.isEmpty() || isNoPluginError(error)) {
+                    searchIsEnd = true
+                    loadMoreError = null
+                } else {
+                    loadMoreError = "请检查网络或切换音源后重试"
+                }
             } finally {
                 loadingMore = false
             }
@@ -821,11 +869,13 @@ class MainActivity : ComponentActivity() {
             total > 0 && info.visibleItemsInfo.lastOrNull()?.index == total - 1
         }
     }
-    LaunchedEffect(atEnd, pluginSongs.size, searchIsEnd, loadingMore, submittedQuery) {
+    LaunchedEffect(atEnd, pluginSongs.size, searchIsEnd, loadingMore, submittedQuery, searching, sources) {
         if (atEnd) loadMore()
     }
-    LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
-        item { Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) { OutlinedTextField(value = query, onValueChange = { query = it }, modifier = Modifier.weight(1f), placeholder = { Text("搜索歌曲") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = ""; submittedQuery = "" }) { Icon(Icons.Default.Clear, "清除") } }, shape = RoundedCornerShape(30.dp), singleLine = true, keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { submittedQuery = query.trim(); searchNonce++; keyboardController?.hide(); scope.launch { repository.addSearch(query.trim()) } })); Spacer(Modifier.width(10.dp)); FilledTonalIconButton(onClick = onSettings, modifier = Modifier.size(56.dp)) { Icon(Icons.Default.Settings, "设置") } } }
+    Column(Modifier.fillMaxSize()) {
+        // 顶部搜索栏与设置按钮浮动显示，不随列表滑动
+        Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) { OutlinedTextField(value = query, onValueChange = { query = it }, modifier = Modifier.weight(1f), placeholder = { Text("搜索歌曲") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = ""; submittedQuery = "" }) { Icon(Icons.Default.Clear, "清除") } }, shape = RoundedCornerShape(30.dp), singleLine = true, keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { submittedQuery = query.trim(); searchNonce++; focusManager.clearFocus(); keyboardController?.hide(); scope.launch { repository.addSearch(query.trim()) } })); Spacer(Modifier.width(10.dp)); FilledTonalIconButton(onClick = onSettings, modifier = Modifier.size(56.dp)) { Icon(Icons.Default.Settings, "设置") } }
+        LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
         item { Text("早上好", Modifier.padding(horizontal = 22.dp), fontSize = 28.sp, fontWeight = FontWeight.Bold); Text("发现属于你的音乐", Modifier.padding(horizontal = 22.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
         item { Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) { HomeTile("我喜欢的音乐", Icons.Default.Favorite, Color(0xffffd9e2), Modifier.weight(1f), { onOpenPlaylist(AppRepository.FAVORITE_SHEET) }); HomeTile("导入歌单", Icons.Default.Add, Color(0xffd8f0e3), Modifier.weight(1f), onImportPlaylist) } }
         item { Text("我的歌单", Modifier.padding(horizontal = 22.dp), fontSize = 20.sp, fontWeight = FontWeight.Bold) }
@@ -841,16 +891,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        if (submittedQuery.isNotBlank()) item { LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { if (sources.isEmpty()) items(sourceNames) { name -> FilterChip(selected = false, enabled = false, onClick = {}, label = { Text(name) }) } else items(sources) { source -> FilterChip(selected = source.name == selectedSourcePlatform, onClick = { selectedSourcePlatform = source.name }, label = { Text(source.name) }) } } }
+        // 无可用插件（未安装或全部禁用）时推荐/搜索列表统一显示安装引导
+        if (submittedQuery.isNotBlank() && !hasNoPlugin) item { LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { if (sources.isEmpty()) items(sourceNames) { name -> FilterChip(selected = false, enabled = false, onClick = {}, label = { Text(name) }) } else items(sources) { source -> FilterChip(selected = source.name == selectedSourcePlatform, onClick = { selectedSourcePlatform = source.name }, label = { Text(source.name) }) } } }
         // 每日推荐音源切换芯片
-        if (submittedQuery.isBlank()) item { LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { if (sources.isEmpty()) items(sourceNames) { name -> FilterChip(selected = false, enabled = false, onClick = {}, label = { Text(name) }) } else items(sources) { source -> FilterChip(selected = source.name == dailyPlatform, onClick = { if (dailyPlatform != source.name) { dailyPlatform = source.name; dailyGroups = emptyList(); dailyBoard = null; dailySongs = emptyList(); dailyError = null } }, label = { Text(source.name) }) } } }
-        item { Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Text(if (submittedQuery.isBlank()) "每日推荐" else "搜索结果", Modifier.weight(1f), fontSize = 20.sp, fontWeight = FontWeight.Bold); if (submittedQuery.isBlank()) DailyBoardDropdown(boards = dailyGroups.flatMap { it.items }, selected = dailyBoard, enabled = !dailyLoading, onSelect = { board -> dailyPlatform?.let { saveDailyBoard(context, it, board) }; dailyBoard = board }); if (searching || (submittedQuery.isBlank() && dailyLoading)) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) } }
-        if (searchError != null) item { Text(searchError ?: "", Modifier.padding(horizontal = 22.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error) }
-        if (submittedQuery.isBlank() && dailyError != null) item { Text(dailyError ?: "", Modifier.padding(horizontal = 22.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error) }
-        if (submittedQuery.isBlank()) items(dailySongs) { item -> PluginSongRow(item, favorites.contains("${item.platform}:${item.id}"), { onPlayMedia(item, dailySongs) }, { scope.launch(Dispatchers.IO) { repository.toggleFavorite(item) } }, { qualityDialog = item }, { playlistDialog = item }) }
+        if (submittedQuery.isBlank() && !hasNoPlugin) item { LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { if (sources.isEmpty()) items(sourceNames) { name -> FilterChip(selected = false, enabled = false, onClick = {}, label = { Text(name) }) } else items(sources) { source -> FilterChip(selected = source.name == dailyPlatform, onClick = { if (dailyPlatform != source.name) { dailyPlatform = source.name; dailyGroups = emptyList(); dailyBoard = null; dailySongs = emptyList(); dailyError = null } }, label = { Text(source.name) }) } } }
+        item { Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Text(if (submittedQuery.isBlank()) "每日推荐" else "搜索结果", Modifier.weight(1f), fontSize = 20.sp, fontWeight = FontWeight.Bold); if (submittedQuery.isBlank() && !hasNoPlugin) DailyBoardDropdown(boards = dailyGroups.flatMap { it.items }, selected = dailyBoard, enabled = !dailyLoading, onSelect = { board -> dailyPlatform?.let { saveDailyBoard(context, it, board) }; dailyBoard = board }) } }
+        if (!hasNoPlugin && searchError != null) item { Text(searchError ?: "", Modifier.padding(horizontal = 22.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error) }
+        if (!hasNoPlugin && submittedQuery.isBlank() && dailyError != null) item { Text(dailyError ?: "", Modifier.padding(horizontal = 22.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error) }
+        if (hasNoPlugin) item { NoPluginPrompt(onInstallClick = onInstallPlugin) }
+        else if ((submittedQuery.isNotBlank() && searching) || (submittedQuery.isBlank() && dailyLoading)) items(8) { SongRowSkeleton() }
+        else if (submittedQuery.isBlank()) items(dailySongs) { item -> PluginSongRow(item, favorites.contains("${item.platform}:${item.id}"), { onPlayMedia(item, dailySongs) }, { scope.launch(Dispatchers.IO) { repository.toggleFavorite(item) } }, { qualityDialog = item }, { playlistDialog = item }) }
         else items(pluginSongs) { item -> PluginSongRow(item, favorites.contains("${item.platform}:${item.id}"), { onPlayMedia(item, pluginSongs) }, { scope.launch(Dispatchers.IO) { repository.toggleFavorite(item) } }, { qualityDialog = item }, { playlistDialog = item }) }
-        // 分页底部提示区
-        if (submittedQuery.isNotBlank() && pluginSongs.isNotEmpty() && !searchIsEnd) {
+        // 分页底部提示区：分页失败只在底部展示并支持重试，不再复用顶部条幅
+        if (!hasNoPlugin && submittedQuery.isNotBlank() && pluginSongs.isNotEmpty() && (!searchIsEnd || loadMoreError != null)) {
             item {
                 Box(Modifier.fillMaxWidth().padding(12.dp), Alignment.Center) {
                     if (loadingMore) {
@@ -859,11 +912,17 @@ class MainActivity : ComponentActivity() {
                             Spacer(Modifier.width(8.dp))
                             Text("正在加载下一页", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
+                    } else if (loadMoreError != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("下一页加载失败，$loadMoreError", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                            TextButton(onClick = { loadMore() }) { Text("重试") }
+                        }
                     } else {
                         Text("上滑加载更多", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
+        }
         }
     }
     qualityDialog?.let { item ->
@@ -918,7 +977,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun HomeTile(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, color: Color, modifier: Modifier, onClick: () -> Unit) { Card(modifier.height(126.dp).clickable(onClick = onClick), colors = CardDefaults.cardColors(containerColor = color), shape = RoundedCornerShape(22.dp)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.SpaceBetween) { Icon(imageVector = icon, contentDescription = null, tint = Color(0xff314568), modifier = Modifier.size(30.dp)); Text(title, fontWeight = FontWeight.Bold, color = Color(0xff25334c)) } } }
+@Composable private fun HomeTile(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, color: Color, modifier: Modifier, onClick: () -> Unit) { Card(modifier.height(84.dp).clickable(onClick = onClick), colors = CardDefaults.cardColors(containerColor = color), shape = RoundedCornerShape(22.dp)) { Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) { Icon(imageVector = icon, contentDescription = null, tint = Color(0xff314568), modifier = Modifier.size(26.dp)); Text(title, fontWeight = FontWeight.Bold, color = Color(0xff25334c), maxLines = 1, overflow = TextOverflow.Ellipsis) } } }
 @Composable private fun PluginSongRow(item: MediaItem, favorite: Boolean, play: () -> Unit, toggleFavorite: () -> Unit, download: () -> Unit, addPlaylist: () -> Unit) {
     // 显示支持的最高音质 + 大小
     val quality = item.qualities.keys.maxByOrNull { qualityRankOf(it) }
@@ -927,9 +986,58 @@ class MainActivity : ComponentActivity() {
         headlineContent = { Text(item.title, fontWeight = FontWeight.SemiBold) },
         supportingContent = { Text("${item.artist} · ${formatDuration(item.durationMs)} · ${quality ?: "未知音质"}${info?.size?.let { " · ${formatSize(it)}" } ?: ""} · ${item.platform}") },
         leadingContent = { Box(Modifier.size(56.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xffdbe1ff)), Alignment.Center) { if (item.artwork.isNullOrBlank()) Icon(Icons.Default.MusicNote, null, tint = Color.White) else AsyncImage(model = item.artwork, contentDescription = item.title, modifier = Modifier.fillMaxSize()) } },
-        trailingContent = { Row { IconButton(onClick = toggleFavorite) { Icon(if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "收藏") }; IconButton(onClick = download) { Icon(Icons.Default.Download, "下载") }; IconButton(onClick = addPlaylist) { Icon(Icons.Default.PlaylistAdd, "添加歌单") } } },
+        trailingContent = { Row(modifier = Modifier.offset(x = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = toggleFavorite, modifier = Modifier.size(40.dp)) { Icon(if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "收藏") }; IconButton(onClick = download, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Download, "下载") }; IconButton(onClick = addPlaylist, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.PlaylistAdd, "添加歌单") } } },
         modifier = Modifier.clickable(onClick = play).padding(horizontal = 8.dp)
     )
+}
+
+/** 歌曲列表动态骨架图：搜索/每日推荐加载时占位展示 */
+@Composable private fun SongRowSkeleton() {
+    val transition = rememberInfiniteTransition(label = "skeleton")
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(animation = tween(900), repeatMode = RepeatMode.Reverse),
+        label = "skeletonAlpha"
+    )
+    val placeholder = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = alpha)
+    ListItem(
+        headlineContent = { Box(Modifier.fillMaxWidth(0.55f).height(16.dp).clip(RoundedCornerShape(4.dp)).background(placeholder)) },
+        supportingContent = { Box(Modifier.fillMaxWidth(0.85f).height(12.dp).clip(RoundedCornerShape(4.dp)).background(placeholder)) },
+        leadingContent = { Box(Modifier.size(56.dp).clip(RoundedCornerShape(14.dp)).background(placeholder)) },
+        modifier = Modifier.padding(horizontal = 8.dp)
+    )
+}
+
+/** 无可用音源插件时的统一安装引导：推荐列表与搜索结果共用 */
+@Composable private fun NoPluginPrompt(onInstallClick: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp, vertical = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier.size(88.dp).clip(RoundedCornerShape(28.dp))
+                .background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Extension,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.size(44.dp)
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("音乐世界，从这里开始", fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "安装音源插件，获取音乐信息",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = onInstallClick) { Text("安装音源插件") }
+    }
 }
 
 /** 每日推荐当日选择落盘，跨天失效重选 */
@@ -980,11 +1088,11 @@ private fun saveDailyBoard(context: android.content.Context, platform: String, b
     fun labelOf(board: TopListItem): String =
         if ((titleCounts[board.title] ?: 0) > 1 && board.groupTitle.isNotBlank()) "${board.groupTitle} · ${board.title}"
         else board.title.ifBlank { "未知榜单" }
-    Box {
-        OutlinedButton(
+    Box(modifier = Modifier.offset(x = 8.dp)) {
+        TextButton(
             onClick = { expanded = true },
             enabled = enabled && boards.isNotEmpty(),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
         ) {
             Text(
                 selected?.let(::labelOf) ?: "选择榜单",
@@ -992,13 +1100,21 @@ private fun saveDailyBoard(context: android.content.Context, platform: String, b
             )
             Icon(Icons.Default.ArrowDropDown, "选择榜单")
         }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.width(220.dp).height(300.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
             boards.forEach { board ->
+                val isSelected = board.id == selected?.id && board.groupTitle == selected.groupTitle
                 DropdownMenuItem(
-                    text = { Text(labelOf(board), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    text = { Text(labelOf(board), color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                    trailingIcon = { if (isSelected) Icon(Icons.Default.Check, "已选", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.offset(x = (-4).dp)) },
+                    contentPadding = PaddingValues(start = 20.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
                     onClick = {
                         expanded = false
-                        if (board.id != selected?.id || board.groupTitle != selected.groupTitle) onSelect(board)
+                        if (!isSelected) onSelect(board)
                     }
                 )
             }
@@ -1007,40 +1123,122 @@ private fun saveDailyBoard(context: android.content.Context, platform: String, b
 }
 
 private fun qualityRank(key: String) = qualityRankOf(key)
+/** 无插件类错误统一识别：命中时由安装引导承载，不再弹旧条幅 */
+private fun isNoPluginError(error: Throwable): Boolean =
+    error.message?.contains("无可用插件") == true
 private fun formatDuration(milliseconds: Long): String { if (milliseconds <= 0) return "0:00"; val seconds = milliseconds / 1000; return "%d:%02d".format(seconds / 60, seconds % 60) }
 private fun formatSize(bytes: Long): String = if (bytes <= 0) "未知大小" else if (bytes < 1024 * 1024) "${bytes / 1024} KB" else "%.1f MB".format(bytes / 1024f / 1024f)
 @Composable private fun MiniPlayer(
     now: NowPlaying?, playing: Boolean, buffering: Boolean,
+    positionMs: Long, durationMs: Long,
     onPrev: () -> Unit, onToggle: () -> Unit, onNext: () -> Unit,
-    onOpenQueue: () -> Unit, onOpenPlayer: () -> Unit
+    onOpenPlayer: () -> Unit
 ) {
     val enabled = now != null
     val showLoading = now?.loading == true || buffering
-    Row(modifier = Modifier.fillMaxWidth().clickable(onClick = onOpenPlayer).padding(horizontal = 18.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(modifier = Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
-            val art = now?.item?.artwork
-            if (art.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, tint = Color.White)
-            else AsyncImage(model = art, contentDescription = now?.item?.title, modifier = Modifier.fillMaxSize())
-            if (showLoading) {
-                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+    val defaultBg = MaterialTheme.colorScheme.secondaryContainer
+    val art = now?.item?.artwork
+    // 封面取色：无封面时保持默认色，切换歌曲时先回落到默认色
+    var artworkBg by remember(art) { mutableStateOf<Color?>(null) }
+    val miniPlayerContext = LocalContext.current
+    // 禁用硬件位图，否则 getPixel 会抛 HARDWARE 异常导致崩溃
+    val painter = rememberAsyncImagePainter(
+        model = coil.request.ImageRequest.Builder(miniPlayerContext).data(art).allowHardware(false).build()
+    )
+    val drawable = (painter.state as? AsyncImagePainter.State.Success)?.result?.drawable
+    LaunchedEffect(drawable) {
+        artworkBg = runCatching {
+            drawable?.let { drawableToMiniPlayerBitmap(it) }?.let { dominantColorFromMiniPlayerBitmap(it) }
+        }.getOrNull()
+    }
+    val containerColor = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
+    val contentColor = if (containerColor.luminance() > 0.5f) Color.Black else Color.White
+    val subContentColor = contentColor.copy(alpha = 0.7f)
+    val buttonTint = if (enabled) contentColor else contentColor.copy(alpha = 0.38f)
+    val progress = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(16.dp)).background(containerColor).clickable(onClick = onOpenPlayer)
+    ) {
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier.fillMaxWidth().height(2.dp),
+            color = contentColor,
+            trackColor = contentColor.copy(alpha = 0.2f),
+        )
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(modifier = Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
+                if (art.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, tint = Color.White)
+                else Image(painter = painter, contentDescription = now?.item?.title, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                if (showLoading) {
+                    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                    }
                 }
             }
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(now?.item?.title ?: "暂无播放", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = contentColor)
+                Text(
+                    now?.let { np ->
+                        "${np.item.artist} · ${formatDuration(np.item.durationMs)} · ${MusicQuality.labelOf(np.qualityKey)}${np.size?.let { " · ${formatSize(it)}" } ?: ""} · ${np.item.platform}"
+                    } ?: "点击搜索结果开始播放",
+                    fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, color = subContentColor
+                )
+            }
+            Row(modifier = Modifier.offset(x = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onPrev, enabled = enabled) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = buttonTint) }
+                IconButton(onClick = onToggle, enabled = enabled) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放暂停", tint = buttonTint) }
+                IconButton(onClick = onNext, enabled = enabled) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = buttonTint) }
+            }
         }
-        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-            Text(now?.item?.title ?: "暂无播放", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                now?.let { np ->
-                    "${np.item.artist} · ${formatDuration(np.item.durationMs)} · ${MusicQuality.labelOf(np.qualityKey)}${np.size?.let { " · ${formatSize(it)}" } ?: ""} · ${np.item.platform}"
-                } ?: "点击搜索结果开始播放",
-                fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
-            )
-        }
-        IconButton(onClick = onPrev, enabled = enabled) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首") }
-        IconButton(onClick = onToggle, enabled = enabled) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放暂停") }
-        IconButton(onClick = onNext, enabled = enabled) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首") }
-        IconButton(onClick = onOpenQueue) { Icon(imageVector = Icons.Default.QueueMusic, contentDescription = "播放列表") }
     }
+}
+
+/** Drawable 转 Bitmap：BitmapDrawable 直接复用（硬件位图转一份软件位图），其余类型绘制到新 Bitmap */
+private fun drawableToMiniPlayerBitmap(drawable: android.graphics.drawable.Drawable): android.graphics.Bitmap? {
+    if (drawable is android.graphics.drawable.BitmapDrawable) {
+        val bmp = drawable.bitmap ?: return null
+        return if (bmp.config == android.graphics.Bitmap.Config.HARDWARE) {
+            runCatching { bmp.copy(android.graphics.Bitmap.Config.ARGB_8888, false) }.getOrNull()
+        } else bmp
+    }
+    val w = drawable.intrinsicWidth.takeIf { it > 0 } ?: 64
+    val h = drawable.intrinsicHeight.takeIf { it > 0 } ?: 64
+    return runCatching {
+        val bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bmp)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+        bmp
+    }.getOrNull()
+}
+
+/** 缩小到 16x16 取平均色作为封面代表色，失败返回 null 以便回落默认色，绝不抛异常 */
+private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Color? {
+    return runCatching {
+        val safe = if (src.config == android.graphics.Bitmap.Config.HARDWARE) {
+            src.copy(android.graphics.Bitmap.Config.ARGB_8888, false) ?: return null
+        } else src
+        val bmp = android.graphics.Bitmap.createScaledBitmap(safe, 16, 16, true)
+        var rSum = 0L
+        var gSum = 0L
+        var bSum = 0L
+        var count = 0L
+        for (x in 0 until 16) {
+            for (y in 0 until 16) {
+                val px = bmp.getPixel(x, y)
+                if (android.graphics.Color.alpha(px) < 128) continue
+                rSum += android.graphics.Color.red(px)
+                gSum += android.graphics.Color.green(px)
+                bSum += android.graphics.Color.blue(px)
+                count++
+            }
+        }
+        if (!bmp.isRecycled) runCatching { bmp.recycle() }
+        if (safe !== src && !safe.isRecycled) runCatching { safe.recycle() }
+        if (count == 0L) return null
+        Color(android.graphics.Color.rgb((rSum / count).toInt(), (gSum / count).toInt(), (bSum / count).toInt()))
+    }.getOrNull()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1058,7 +1256,8 @@ private fun formatSize(bytes: Long): String = if (bytes <= 0) "未知大小" els
     playMode: Int, onModeChange: (Int) -> Unit,
     onOpenLyricFullscreen: () -> Unit
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // 默认半屏展开，上滑进入全屏：允许 PartiallyExpanded 锚点
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     ModalBottomSheet(onDismissRequest = onClose, sheetState = sheetState) {
         Column(Modifier.fillMaxWidth().padding(24.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

@@ -81,7 +81,7 @@ class MusicSourceService(context: Context, private val router: PluginRouter = Pl
         ensureLoaded()
         val adapter = platform?.let { router.findAdapterByPlatform(it) }
             ?: router.activeSources().firstOrNull()
-            ?: throw IllegalStateException("暂无可用音源插件，请到设置 - 插件管理安装")
+            ?: throw IllegalStateException("无可用插件")
         return router.search(adapter, query, page)
     }
 

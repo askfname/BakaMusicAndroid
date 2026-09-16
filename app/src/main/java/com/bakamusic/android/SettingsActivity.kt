@@ -8,11 +8,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -20,15 +25,26 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import java.io.File
 
 class SettingsActivity : ComponentActivity() {
+    companion object {
+        /** 首页无插件引导跳转时携带 true，设置页自动定位到“插件管理” */
+        const val EXTRA_SCROLL_TO_PLUGIN = "scroll_to_plugin"
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(statusBarStyle = SystemBarStyle.auto(0, 0), navigationBarStyle = SystemBarStyle.auto(0, 0))
@@ -41,6 +57,13 @@ class SettingsActivity : ComponentActivity() {
     val manager = remember { PluginManager(context.applicationContext) }
     val repository = remember { AppRepository(context.applicationContext) }
     val scope = rememberCoroutineScope()
+    // 首页无插件引导进入时自动定位到“插件管理”
+    val scrollToPlugin = (context as? android.app.Activity)?.intent
+        ?.getBooleanExtra(SettingsActivity.EXTRA_SCROLL_TO_PLUGIN, false) == true
+    val listState = rememberLazyListState()
+    LaunchedEffect(scrollToPlugin) {
+        if (scrollToPlugin) runCatching { listState.scrollToItem(PLUGIN_GROUP_INDEX) }
+    }
     var plugins by remember { mutableStateOf(manager.allPlugins()) }
     var subscriptions by remember { mutableStateOf(manager.subscriptions()) }
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
@@ -88,8 +111,8 @@ class SettingsActivity : ComponentActivity() {
             notice = result.fold({ "已安装插件：${it.name} ${it.version}" }, { "安装失败：${it.message}" }); refresh()
         }
     }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(top = 18.dp, bottom = 24.dp)) {
-        item { Text("设置", Modifier.padding(horizontal = 22.dp, vertical = 18.dp), fontSize = 28.sp, fontWeight = FontWeight.Bold) }
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface), contentPadding = PaddingValues(top = 18.dp, bottom = 24.dp)) {
+        item { Text("设置", Modifier.padding(horizontal = 22.dp, vertical = 18.dp), fontSize = 28.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) }
         item {
             SettingGroup("播放") {
                 SettingRow("默认播放音质", MusicQuality.labelOf(playQuality), Icons.Default.HighQuality) { dialog = "playQuality" }
@@ -115,26 +138,65 @@ class SettingsActivity : ComponentActivity() {
 
 @Composable private fun PluginManagementGroup(plugins: List<InstalledPlugin>, subscriptions: List<PluginSubscription>, loading: Boolean, onInstallLocal: () -> Unit, onInstallNetwork: () -> Unit, onAddSubscription: () -> Unit, onUpdate: (PluginSubscription) -> Unit, onDeleteSubscription: (PluginSubscription) -> Unit, onToggle: (InstalledPlugin, Boolean) -> Unit, onRemove: (InstalledPlugin) -> Unit, onMove: (InstalledPlugin, Int) -> Unit) {
     Text("插件管理", Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-    Card(Modifier.padding(horizontal = 14.dp).fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) {
-        Column {
+    SettingsGroupCard {
             Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Button(onClick = onInstallLocal, enabled = !loading, modifier = Modifier.weight(1f)) { Icon(Icons.Default.FolderOpen, null); Text("本地安装") }; Button(onClick = onInstallNetwork, enabled = !loading, modifier = Modifier.weight(1f)) { if (loading) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text(if (loading) "处理中" else "网络安装") } }
-            var priorityExpanded by rememberSaveable { mutableStateOf(false) }
-            Row(Modifier.fillMaxWidth().clickable { priorityExpanded = !priorityExpanded }.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { Text("音源优先级", Modifier.weight(1f), fontWeight = FontWeight.Bold); Icon(if (priorityExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, "展开") }
-            val activePlugins = plugins.filter { it.enabled }
-            if (priorityExpanded) { if (activePlugins.isEmpty()) Text("暂无启用的音源插件", Modifier.padding(16.dp)); activePlugins.forEachIndexed { index, plugin -> PriorityRow(plugin, index, activePlugins.lastIndex, onMove) } }
-            HorizontalDivider()
             var installedExpanded by rememberSaveable { mutableStateOf(false) }
-            Row(Modifier.fillMaxWidth().clickable { installedExpanded = !installedExpanded }.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { Text("已安装插件", Modifier.weight(1f), fontWeight = FontWeight.Bold); Icon(if (installedExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, "展开") }
-            if (installedExpanded) { if (plugins.isEmpty()) Text("暂无已安装插件", Modifier.padding(16.dp)); plugins.forEach { plugin -> ListItem(headlineContent = { Text(plugin.name) }, supportingContent = { Text("${plugin.version} · ${if (plugin.enabled) "已启用" else "已禁用"}") }, leadingContent = { Icon(Icons.Default.Extension, null) }, trailingContent = { Row(verticalAlignment = Alignment.CenterVertically) { Switch(checked = plugin.enabled, onCheckedChange = { onToggle(plugin, it) }); IconButton(onClick = { onRemove(plugin) }) { Icon(Icons.Default.Delete, "卸载") } } }) } }
+            Row(Modifier.fillMaxWidth().clickable { installedExpanded = !installedExpanded }.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("已安装插件", fontWeight = FontWeight.Bold); Text("禁用或删除插件，长按拖动可调整优先级", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Icon(if (installedExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, "展开") }
+            if (installedExpanded) { if (plugins.isEmpty()) Text("暂无已安装插件", Modifier.padding(16.dp)) else { plugins.forEachIndexed { index, plugin -> key(plugin.id) { InstalledPluginRow(plugin, index, plugins.lastIndex, onToggle, onRemove, onMove) } } } }
             HorizontalDivider()
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text("订阅源", Modifier.weight(1f), fontWeight = FontWeight.Bold); TextButton(onClick = onAddSubscription) { Icon(Icons.Default.Add, null); Text("添加订阅") } }
             if (subscriptions.isEmpty()) Text("暂无订阅，点击添加订阅", Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-            subscriptions.forEach { item -> ListItem(headlineContent = { Text(item.name) }, supportingContent = { Text(item.url) }, leadingContent = { Icon(Icons.Default.RssFeed, null) }, trailingContent = { Row { IconButton(onClick = { onUpdate(item) }, enabled = !loading) { Icon(Icons.Default.Refresh, "更新订阅") }; IconButton(onClick = { onDeleteSubscription(item) }, enabled = !loading) { Icon(Icons.Default.Delete, "删除订阅") } } }) }
-        }
+            subscriptions.forEach { item -> ListItem(headlineContent = { Text(item.name) }, supportingContent = { Text(item.url) }, leadingContent = { Icon(Icons.Default.RssFeed, null) }, trailingContent = { Row { IconButton(onClick = { onUpdate(item) }, enabled = !loading) { Icon(Icons.Default.Refresh, "更新订阅") }; IconButton(onClick = { onDeleteSubscription(item) }, enabled = !loading) { Icon(Icons.Default.Delete, "删除订阅") } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent)) }
     }
 }
 
-@Composable private fun PriorityRow(plugin: InstalledPlugin, index: Int, lastIndex: Int, onMove: (InstalledPlugin, Int) -> Unit) { var distance = 0f; ListItem(headlineContent = { Text("${index + 1}. ${plugin.name}") }, supportingContent = { Text("长按拖动或使用箭头调整优先级") }, leadingContent = { Icon(Icons.Default.DragHandle, null, modifier = Modifier.pointerInput(plugin.id) { detectDragGesturesAfterLongPress(onDragStart = { distance = 0f }, onDrag = { _, amount -> distance += amount.y; if (distance > 56f && index < lastIndex) { onMove(plugin, 1); distance = 0f }; if (distance < -56f && index > 0) { onMove(plugin, -1); distance = 0f } }) }) }, trailingContent = { Row { IconButton(onClick = { onMove(plugin, -1) }, enabled = index > 0) { Icon(Icons.Default.KeyboardArrowUp, "上移") }; IconButton(onClick = { onMove(plugin, 1) }, enabled = index < lastIndex) { Icon(Icons.Default.KeyboardArrowDown, "下移") } } }) }
+@Composable private fun InstalledPluginRow(plugin: InstalledPlugin, position: Int, lastIndex: Int, onToggle: (InstalledPlugin, Boolean) -> Unit, onRemove: (InstalledPlugin) -> Unit, onMove: (InstalledPlugin, Int) -> Unit) {
+    var dragging by remember { mutableStateOf(false) }
+    // 手指自拖拽起点累计的位移，手势里只写这个值，不做换位判断，避免闭包过期
+    var totalDrag by remember { mutableStateOf(0f) }
+    var startSlot by remember { mutableStateOf(0) }
+    var itemHeightPx by remember { mutableStateOf(0) }
+    val h = if (itemHeightPx > 0) itemHeightPx.toFloat() else with(LocalDensity.current) { 72.dp.toPx() }
+    val latestPosition = rememberUpdatedState(position)
+    // 手指位移钳制在列表范围内，卡片拖不出列表
+    val boundedDrag = totalDrag.coerceIn((0 - startSlot) * h, (lastIndex - startSlot) * h)
+    // 手指位置对应的目标槽位（半格换位），用最新 position 逐步换位逼近
+    val targetSlot = (startSlot + boundedDrag / h).roundToInt().coerceIn(0, lastIndex)
+    LaunchedEffect(totalDrag, position, dragging) {
+        if (!dragging) return@LaunchedEffect
+        if (targetSlot > position) onMove(plugin, 1)
+        else if (targetSlot < position) onMove(plugin, -1)
+    }
+    // 卡片位移 = 手指总量 - 已换位补偿，恒等于手指位置
+    val currentTranslation = if (dragging) boundedDrag - (position - startSlot) * h else 0f
+    // 拖拽中直接取值显示（与布局同帧提交，换位无错位抖动）；后台动画只在松手后弹簧回槽
+    val settleAnim by animateFloatAsState(targetValue = currentTranslation, animationSpec = if (dragging) snap() else spring(), label = "dragSettle")
+    val dragScale by animateFloatAsState(targetValue = if (dragging) 1.03f else 1f, animationSpec = spring(), label = "dragScale")
+    ListItem(
+        headlineContent = { Text("${position + 1}. ${plugin.name}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        supportingContent = { Text("${plugin.version} · ${if (plugin.enabled) "已启用" else "已禁用"}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        leadingContent = {
+            Icon(Icons.Default.DragHandle, null)
+        },
+        trailingContent = { Row(verticalAlignment = Alignment.CenterVertically) { Switch(checked = plugin.enabled, onCheckedChange = { onToggle(plugin, it) }); IconButton(onClick = { onRemove(plugin) }) { Icon(Icons.Default.Delete, "卸载") } } },
+        modifier = Modifier.onSizeChanged { itemHeightPx = it.height }.zIndex(if (dragging) 1f else 0f).graphicsLayer {
+            translationY = if (dragging) currentTranslation else settleAnim
+            scaleX = dragScale
+            scaleY = dragScale
+            shadowElevation = if (dragging) 16.dp.toPx() else 0f
+            clip = false
+        }.pointerInput(plugin.id) {
+            // 整卡长按拖拽：短按点击仍透传给开关/删除按钮
+            detectDragGesturesAfterLongPress(
+                onDragStart = { startSlot = latestPosition.value; totalDrag = 0f; dragging = true },
+                onDragCancel = { dragging = false; totalDrag = 0f },
+                onDragEnd = { dragging = false; totalDrag = 0f },
+                onDrag = { _, amount -> totalDrag = (totalDrag + amount.y).coerceIn(-10000f, 10000f) }
+            )
+        },
+        colors = ListItemDefaults.colors(containerColor = if (dragging) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)
+    )
+}
 
 @Composable private fun QualitySelectDialog(title: String, current: String, onSelect: (String) -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
@@ -159,5 +221,16 @@ class SettingsActivity : ComponentActivity() {
     AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { OutlinedTextField(valueOne, onValueOne, label = { Text(labelOne) }, singleLine = true); if (labelTwo != null) OutlinedTextField(valueTwo, onValueTwo, label = { Text(labelTwo) }, singleLine = true) } }, confirmButton = { TextButton(onClick = onConfirm, enabled = valueOne.isNotBlank()) { Text(confirm) } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
 
-@Composable private fun SettingGroup(title: String, content: @Composable ColumnScope.() -> Unit) { Text(title, Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold); Card(Modifier.padding(horizontal = 14.dp).fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) { Column(content = content) } }
-@Composable private fun SettingRow(title: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) { ListItem(headlineContent = { Text(title) }, supportingContent = { Text(value) }, leadingContent = { Icon(icon, null) }, trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable(onClick = onClick)) }
+/** 设置页 LazyColumn 中“插件管理”分组的下标：标题0/播放1/下载2/插件管理3 */
+private const val PLUGIN_GROUP_INDEX = 3
+
+/** 设置页分组卡片：所有设置项（含插件管理）共用 Card 默认容器色，跟随主题，主题变化时自动一致 */
+@Composable private fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        Modifier.padding(horizontal = 14.dp).fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge
+    ) { Column(content = content) }
+}
+
+@Composable private fun SettingGroup(title: String, content: @Composable ColumnScope.() -> Unit) { Text(title, Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold); SettingsGroupCard(content = content) }
+@Composable private fun SettingRow(title: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) { ListItem(headlineContent = { Text(title) }, supportingContent = { Text(value) }, leadingContent = { Icon(icon, null) }, trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable(onClick = onClick), colors = ListItemDefaults.colors(containerColor = Color.Transparent)) }

@@ -110,31 +110,16 @@ class PluginManager(private val context: Context) {
         savePlugins(readPlugins().filterNot { it.id == id }.reorder())
     }
     fun move(id: String, delta: Int) {
-        val all = readPlugins().sortedBy { it.order }
-        val active = all.filter { it.enabled }
-        val fromActive = active.indexOfFirst { it.id == id }
-        if (fromActive >= 0) {
-            // 音源优先级仅针对启用插件
-            val toActive = (fromActive + delta).coerceIn(0, active.lastIndex)
-            if (fromActive == toActive) return
-            val newActive = active.toMutableList()
-            val item = newActive.removeAt(fromActive)
-            newActive.add(toActive, item)
-            val disabled = all.filterNot { it.enabled }
-            val newAll = (newActive + disabled).mapIndexed { index, p -> p.copy(order = index) }
-            persistPlugins(newAll)
-            return
-        }
-        // 禁用插件在全量中直接移动
-        val full = all.toMutableList()
+        // 已安装列表整体按 order 相邻交换，启用/禁用统一处理；
+        // 实际播放优先级取启用子集的相对顺序，与展示顺序一致
+        val full = readPlugins().sortedBy { it.order }.toMutableList()
         val from = full.indexOfFirst { it.id == id }
         if (from < 0) return
         val to = (from + delta).coerceIn(0, full.lastIndex)
         if (from == to) return
         val item = full.removeAt(from)
         full.add(to, item)
-        val newAll = full.mapIndexed { index, p -> p.copy(order = index) }
-        persistPlugins(newAll)
+        persistPlugins(full.mapIndexed { index, p -> p.copy(order = index) })
     }
 
     private suspend fun installFromUrl(url: String): Int = withContext(Dispatchers.IO) {
