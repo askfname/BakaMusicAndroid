@@ -1,11 +1,20 @@
 package com.bakamusic.android.ui
 
+import android.app.Activity
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.view.View
+import android.view.Window
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -15,14 +24,19 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.bakamusic.android.data.*
@@ -57,6 +71,58 @@ class MainActivity : ComponentActivity() {
         ),
         content = content
     )
+}
+
+private fun hideSystemBars(window: Window) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        window.setDecorFitsSystemWindows(false)
+        window.insetsController?.let { controller ->
+            controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+            controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    } else {
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
+    }
+}
+
+private fun showSystemBars(window: Window) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+    } else {
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            )
+    }
+}
+
+@Composable private fun FullscreenImmersiveEffect() {
+    val view = LocalView.current
+    DisposableEffect(view) {
+        var ctx: android.content.Context? = view.context
+        var activity: Activity? = null
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is Activity) { activity = ctx; break }
+            ctx = ctx.baseContext
+        }
+        val activityWindow = activity?.window
+        val dialogWindow = (view.parent as? DialogWindowProvider)?.window
+        val windows = listOfNotNull(activityWindow, dialogWindow)
+        windows.forEach { hideSystemBars(it) }
+        onDispose {
+            windows.forEach { showSystemBars(it) }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -202,20 +268,36 @@ class MainActivity : ComponentActivity() {
     if (lyricFullscreen) {
         Dialog(
             onDismissRequest = { lyricFullscreen = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
         ) {
-            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                Column(Modifier.fillMaxSize().padding(24.dp)) {
+            FullscreenImmersiveEffect()
+            // 与音乐播放器界面一样的封面取色对角线渐变背景（含切换时的平滑过渡）
+            val (lyricGradientStart, lyricGradientEnd) = rememberCoverGradientColors(viewModel.nowPlaying?.item?.artwork)
+            val lyricGradientBrush = remember(lyricGradientStart, lyricGradientEnd) {
+                Brush.linearGradient(
+                    colors = listOf(lyricGradientStart, lyricGradientEnd),
+                    start = Offset.Zero,
+                    end = Offset.Infinite
+                )
+            }
+            val lyricContentTarget =
+                if ((lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.5f) Color.Black else Color.White
+            val lyricSubTarget = lyricContentTarget.copy(alpha = 0.7f)
+            val lyricContent by animateColorAsState(targetValue = lyricContentTarget, animationSpec = tween(600), label = "lyricContent")
+            val lyricSubContent by animateColorAsState(targetValue = lyricSubTarget, animationSpec = tween(600), label = "lyricSubContent")
+            Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
+                Box(Modifier.fillMaxSize().background(lyricGradientBrush)) {
+                Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("歌词", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                            Text("歌词", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = lyricContent)
                             Text(
                                 viewModel.nowPlaying?.let { "${it.item.title} · ${it.item.artist}" } ?: "",
-                                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 12.sp, color = lyricSubContent,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                         }
-                        IconButton(onClick = { lyricFullscreen = false }) { Icon(Icons.Default.FullscreenExit, "退出全屏") }
+                        IconButton(onClick = { lyricFullscreen = false }) { Icon(Icons.Default.FullscreenExit, "退出全屏", tint = lyricContent) }
                     }
                     Spacer(Modifier.height(8.dp))
                     Box(Modifier.fillMaxWidth().weight(1f)) {
@@ -225,9 +307,12 @@ class MainActivity : ComponentActivity() {
                             loading = viewModel.lyricLoading && viewModel.nowPlaying != null,
                             markerFraction = 0.24f,
                             fontScale = 1.35f,
-                            centered = true
+                            centered = true,
+                            activeColor = lyricContent,
+                            inactiveColor = lyricSubContent
                         )
                     }
+                }
                 }
             }
         }

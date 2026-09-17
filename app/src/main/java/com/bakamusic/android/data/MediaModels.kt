@@ -1,7 +1,7 @@
 package com.bakamusic.android.data
 
 /** 点播解析整体超时：超时终止请求，并按失败原因显示对应的播放提示 */
-const val PLAY_RESOLVE_TIMEOUT_MS = 50_000L
+const val PLAY_RESOLVE_TIMEOUT_MS = 20_000L
 
 /** 当前播放项：已解析地址与实际播放音质，供播放栏/播放页显示 */
 data class NowPlaying(
@@ -110,7 +110,7 @@ data class TopListItem(
     val rawJson: String? = null
 )
 
-/** 播放解析请求超时（50s）：与协程取消区分，超时显示 3003 错误弹窗。 */
+/** 播放解析请求超时（20s）：与协程取消区分，超时显示 3003 错误弹窗。 */
 class MediaResolveTimeoutException(message: String) : Exception(message)
 
 /** 插件运行时已被重载/释放：调用方应按平台名重新获取最新适配器重试一次。 */

@@ -501,8 +501,8 @@ function getTopListDetail(topListItem) {"""
             )
         }
 
-        /** 单次播放解析超时：50s，超时抛出 MediaResolveTimeoutException */
-        private val mediaSourceTimeoutMs = 50_000L
+        /** 单次播放解析超时：20s，超时抛出 MediaResolveTimeoutException */
+        private val mediaSourceTimeoutMs = 20_000L
         /** 详情补全超时：最佳努力，超时返回 null 并直接走播放解析，不阻塞整体 50s 预算 */
         private val musicInfoTimeoutMs = 10_000L
         /** 未完成的播放解析任务：新请求到来时取消旧任务，避免单线程排队阻塞 */

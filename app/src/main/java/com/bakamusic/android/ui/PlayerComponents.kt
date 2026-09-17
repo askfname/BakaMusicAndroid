@@ -4,7 +4,13 @@ import com.bakamusic.android.data.*
 import com.bakamusic.android.service.*
 import com.bakamusic.android.plugin.*
 import com.bakamusic.android.util.*
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -25,11 +31,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -38,6 +50,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
 import coil.compose.rememberAsyncImagePainter
+import coil.imageLoader
 import com.bakamusic.android.*
 import kotlinx.coroutines.*
 
@@ -150,6 +163,91 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
     }.getOrNull()
 }
 
+private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Color, Color>? {
+    return runCatching {
+        val safe = if (src.config == android.graphics.Bitmap.Config.HARDWARE) {
+            src.copy(android.graphics.Bitmap.Config.ARGB_8888, false) ?: return null
+        } else src
+        val n = 24
+        val bmp = android.graphics.Bitmap.createScaledBitmap(safe, n, n, true)
+        var r1 = 0L; var g1 = 0L; var b1 = 0L; var c1 = 0L
+        var r2 = 0L; var g2 = 0L; var b2 = 0L; var c2 = 0L
+        for (x in 0 until n) {
+            for (y in 0 until n) {
+                val px = bmp.getPixel(x, y)
+                if (android.graphics.Color.alpha(px) < 128) continue
+                if (x + y < n) {
+                    r1 += android.graphics.Color.red(px)
+                    g1 += android.graphics.Color.green(px)
+                    b1 += android.graphics.Color.blue(px)
+                    c1++
+                } else {
+                    r2 += android.graphics.Color.red(px)
+                    g2 += android.graphics.Color.green(px)
+                    b2 += android.graphics.Color.blue(px)
+                    c2++
+                }
+            }
+        }
+        if (!bmp.isRecycled) runCatching { bmp.recycle() }
+        if (safe !== src && !safe.isRecycled) runCatching { safe.recycle() }
+        if (c1 == 0L || c2 == 0L) return null
+        var start = Color(android.graphics.Color.rgb((r1 / c1).toInt(), (g1 / c1).toInt(), (b1 / c1).toInt()))
+        var end = Color(android.graphics.Color.rgb((r2 / c2).toInt(), (g2 / c2).toInt(), (b2 / c2).toInt()))
+        val dr = (start.red - end.red) * 255f
+        val dg = (start.green - end.green) * 255f
+        val db = (start.blue - end.blue) * 255f
+        if (dr * dr + dg * dg + db * db < 40f * 40f) {
+            end = Color(
+                (end.red * 0.72f).coerceIn(0f, 1f),
+                (end.green * 0.72f).coerceIn(0f, 1f),
+                (end.blue * 0.72f).coerceIn(0f, 1f),
+                1f
+            )
+        }
+        start to end
+    }.getOrNull()
+}
+
+@Composable fun rememberCoverGradientColors(artwork: String?): Pair<Color, Color> {
+    val defaultStart = MaterialTheme.colorScheme.secondaryContainer
+    val defaultEnd = MaterialTheme.colorScheme.surfaceContainerLow
+    var raw by remember(artwork) { mutableStateOf<Pair<Color, Color>?>(null) }
+    val context = LocalContext.current
+    LaunchedEffect(artwork) {
+        if (artwork.isNullOrBlank()) {
+            raw = null
+            return@LaunchedEffect
+        }
+        // 注意：之前用未挂载到 Image() 的 rememberAsyncImagePainter 取 drawable，
+        // Coil 需布局尺寸才能解析请求而不执行，导致一直回退到主题色。
+        // 改为 ImageLoader.execute() 直接在 IO 线程加载解析。
+        raw = withContext(Dispatchers.IO) {
+            runCatching {
+                val request = coil.request.ImageRequest.Builder(context)
+                    .data(artwork)
+                    .allowHardware(false)
+                    .build()
+                val result = context.imageLoader.execute(request)
+                val drawable = (result as? coil.request.SuccessResult)?.drawable ?: return@runCatching null
+                drawableToMiniPlayerBitmap(drawable)?.let { gradientColorsFromCoverBitmap(it) }
+            }.getOrNull()
+        }
+    }
+    val targetStart = raw?.first ?: defaultStart
+    val targetEnd = raw?.second ?: defaultEnd
+    val animatedStart by animateColorAsState(targetValue = targetStart, animationSpec = tween(600), label = "coverGradientStart")
+    val animatedEnd by animateColorAsState(targetValue = targetEnd, animationSpec = tween(600), label = "coverGradientEnd")
+    return animatedStart to animatedEnd
+}
+
+@Composable fun rememberCoverGradientBrush(artwork: String?): Brush {
+    val (start, end) = rememberCoverGradientColors(artwork)
+    return remember(start, end) {
+        Brush.linearGradient(colors = listOf(start, end), start = Offset.Zero, end = Offset.Infinite)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun PlayerSheet(
     now: NowPlaying?, playing: Boolean,
@@ -165,14 +263,51 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
     playMode: Int, onModeChange: (Int) -> Unit,
     onOpenLyricFullscreen: () -> Unit
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-    ModalBottomSheet(onDismissRequest = onClose, sheetState = sheetState) {
-        Column(Modifier.fillMaxWidth().padding(24.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                IconButton(onClick = onOpenDownload, enabled = now != null) { Icon(Icons.Default.Download, "下载") }
-                IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, if (showQueue) "返回播放页" else "播放列表") }
+    val transition = remember { MutableTransitionState(false).apply { targetState = true } }
+    fun dismissAnimated() {
+        if (!transition.targetState) return
+        transition.targetState = false
+    }
+    // 退出动画播完才真正关闭，避免固定延时与动画错位导致的闪烁
+    LaunchedEffect(transition.currentState, transition.isIdle) {
+        if (!transition.targetState && !transition.currentState && transition.isIdle) {
+            onClose()
+        }
+    }
+    Dialog(
+        onDismissRequest = { dismissAnimated() },
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = true)
+    ) {
+        val dialogView = LocalView.current
+        SideEffect {
+            (dialogView.parent as? DialogWindowProvider)?.window?.setDimAmount(0f)
+        }
+        AnimatedVisibility(
+            visibleState = transition,
+            enter = slideInVertically(initialOffsetY = { it }, animationSpec = tween(550)),
+            exit = slideOutVertically(
+                targetOffsetY = { it },
+                animationSpec = tween(durationMillis = 550, easing = CubicBezierEasing(0.8f, 0f, 0.6f, 1f))
+            )
+        ) {
+            val (gradientStart, gradientEnd) = rememberCoverGradientColors(now?.item?.artwork)
+            val gradientBrush = remember(gradientStart, gradientEnd) {
+                Brush.linearGradient(colors = listOf(gradientStart, gradientEnd), start = Offset.Zero, end = Offset.Infinite)
             }
+            val gradientContentTarget =
+                if ((gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.5f) Color.Black else Color.White
+            val gradientSubTarget = gradientContentTarget.copy(alpha = 0.7f)
+            val gradientContent by animateColorAsState(targetValue = gradientContentTarget, animationSpec = tween(600), label = "coverGradientContent")
+            val gradientSubContent by animateColorAsState(targetValue = gradientSubTarget, animationSpec = tween(600), label = "coverGradientSubContent")
+            Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
+                Box(Modifier.fillMaxSize().background(gradientBrush)) {
+                Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { dismissAnimated() }) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = gradientContent) }
+                        Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f), fontWeight = FontWeight.Bold, color = gradientContent)
+                        IconButton(onClick = onOpenDownload, enabled = now != null) { Icon(Icons.Default.Download, "下载", tint = gradientContent) }
+                        IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, if (showQueue) "返回播放页" else "播放列表", tint = gradientContent) }
+                    }
             if (showQueue) {
                 Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = playMode == 0, onClick = { onModeChange(0) }, label = { Text("顺序") }, leadingIcon = { Icon(Icons.Default.Repeat, null, Modifier.size(16.dp)) })
@@ -199,22 +334,22 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
             } else {
                 val item = now?.item
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Box(modifier = Modifier.size(240.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(28.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
-                        if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(88.dp), tint = Color.White)
+                    Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(28.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
+                        if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(112.dp), tint = Color.White)
                         else AsyncImage(model = item?.artwork, contentDescription = item?.title, modifier = Modifier.fillMaxSize())
                     }
                     Spacer(Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.Bottom) {
                         Column(Modifier.weight(1f)) {
-                            Text(item?.title ?: "暂无播放", fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(item?.artist ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(item?.title ?: "暂无播放", fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = gradientContent)
+                            Text(item?.artist ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis, color = gradientContent)
                             Text(
                                 if (now != null) "${formatDuration(item?.durationMs ?: 0)} · ${MusicQuality.labelOf(now.qualityKey)}${now.size?.let { " · ${formatSize(it)}" } ?: ""} · ${item?.platform}"
                                 else "从搜索或歌单中选择歌曲播放",
-                                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                                fontSize = 12.sp, color = gradientSubContent
                             )
                         }
-                        IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质") }
+                        IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质", tint = gradientContent) }
                     }
                     var seeking by remember(now?.key) { mutableStateOf(false) }
                     var seekFrac by remember(now?.key) { mutableStateOf(0f) }
@@ -249,13 +384,13 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
                         thumb = { Box(Modifier.size(22.dp).clip(androidx.compose.foundation.shape.CircleShape).background(if (durationMs > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))) }
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(formatDuration(shownPosMs), fontSize = 12.sp)
+                        Text(formatDuration(shownPosMs), fontSize = 12.sp, color = gradientSubContent)
                         Spacer(Modifier.weight(1f))
-                        Text(formatDuration(durationMs), fontSize = 12.sp)
+                        Text(formatDuration(durationMs), fontSize = 12.sp, color = gradientSubContent)
                     }
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onToggleFavorite, enabled = now != null) { Icon(imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = "收藏") }
-                        IconButton(onClick = onPrev, enabled = now != null) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首") }
+                        IconButton(onClick = onToggleFavorite, enabled = now != null) { Icon(imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = "收藏", tint = gradientContent) }
+                        IconButton(onClick = onPrev, enabled = now != null) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = gradientContent) }
                         if ((now?.loading == true || buffering) && now != null) {
                             Box(Modifier.size(64.dp).clip(RoundedCornerShape(32.dp)).background(MaterialTheme.colorScheme.primary), Alignment.Center) {
                                 CircularProgressIndicator(Modifier.size(30.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 3.dp)
@@ -263,20 +398,23 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
                         } else {
                             FilledIconButton(onClick = onToggle, modifier = Modifier.size(64.dp), enabled = now != null) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放") }
                         }
-                        IconButton(onClick = onNext, enabled = now != null) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首") }
-                        IconButton(onClick = onOpenAddPlaylist, enabled = now != null) { Icon(imageVector = Icons.Default.PlaylistAdd, contentDescription = "加歌单") }
+                        IconButton(onClick = onNext, enabled = now != null) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = gradientContent) }
+                        IconButton(onClick = onOpenAddPlaylist, enabled = now != null) { Icon(imageVector = Icons.Default.PlaylistAdd, contentDescription = "加歌单", tint = gradientContent) }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
-                        Text("歌词", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp)) }
+                        Text("歌词", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), color = gradientContent)
+                        IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp), tint = gradientContent) }
                     }
                     Box(Modifier.fillMaxWidth().height(220.dp)) {
-                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, centered = true)
+                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, centered = true, activeColor = gradientContent, inactiveColor = gradientSubContent)
                     }
+                }
+            }
                 }
             }
         }
     }
+}
 }
 
 @Composable fun LyricsView(
@@ -285,14 +423,16 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
     loading: Boolean,
     markerFraction: Float = 0.24f,
     fontScale: Float = 1f,
-    centered: Boolean = false
+    centered: Boolean = false,
+    activeColor: Color = MaterialTheme.colorScheme.primary,
+    inactiveColor: Color = MaterialTheme.colorScheme.onSurfaceVariant
 ) {
     if (loading) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)); Text("歌词加载中") } }
+        Box(Modifier.fillMaxSize(), Alignment.Center) { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = activeColor); Spacer(Modifier.width(8.dp)); Text("歌词加载中", color = inactiveColor) } }
         return
     }
     if (lines.isEmpty()) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Text("暂无歌词", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Box(Modifier.fillMaxSize(), Alignment.Center) { Text("暂无歌词", color = inactiveColor) }
         return
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -349,7 +489,7 @@ private fun dominantColorFromMiniPlayerBitmap(src: android.graphics.Bitmap): Col
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(top = padTop, bottom = padBottom)) {
             itemsIndexed(lines) { index, line ->
                 val active = index == currentIndex
-                Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal, color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
             }
         }
     }
