@@ -35,6 +35,16 @@ class PluginRouter(private val manager: PluginManager) {
         }
     }
 
+    /**
+     * 搜索项 qualities 为空时（如 bilibili 刻意返回空表、靠 getMusicInfo 补全），
+     * 先补全详情再解析；补全失败则回退用原条目直接解析，不阻塞播放。
+     */
+    private suspend fun maybeEnrich(plugin: MusicPlugin, item: MediaItem): MediaItem {
+        if (item.qualities.isNotEmpty()) return item
+        val enriched = runAbortable { plugin.getMusicInfo(item) } ?: return item
+        return if (enriched.qualities.isNotEmpty()) enriched else item
+    }
+
     /** 替换全量映射，调用方需保证串行调用。 */
     fun replaceAll(entries: List<Pair<InstalledPlugin, MusicPlugin>>) {
         adapters.clear()
@@ -106,15 +116,16 @@ class PluginRouter(private val manager: PluginManager) {
                 Log.d("BakaPlugin", "无当前平台适配器，拒绝解析: ${item.platform}:${item.id}")
                 return null
             }
+        val current = maybeEnrich(plugin, item)
         val fullOrder = qualityOrderLowerFirst(qualityKey)
-        val tried = filterQualityOrderByDeclared(item, fullOrder).ifEmpty { fullOrder }
+        val tried = filterQualityOrderByDeclared(current, fullOrder).ifEmpty { fullOrder }
         for (q in tried) {
-            val res = runAbortable { plugin.getMediaSource(item, q) }
+            val res = runAbortable { plugin.getMediaSource(current, q) }
             if (res?.mediaUrl?.startsWith("http", true) == true) return res
         }
         // 后备：使用 qualities 自带的 url
-        item.qualities[qualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
-            return item.copy(mediaUrl = it)
+        current.qualities[qualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
+            return current.copy(mediaUrl = it)
         }
         return null
     }
@@ -135,22 +146,24 @@ class PluginRouter(private val manager: PluginManager) {
                 Log.d("BakaPlugin", "无当前平台适配器，拒绝解析: ${item.platform}:${item.id}")
                 return null
             }
+        val current = maybeEnrich(plugin, item)
         val fullOrder = qualityOrderLowerFirst(defaultQualityKey)
-        val tried = filterQualityOrderByDeclared(item, fullOrder).ifEmpty { fullOrder }
+        val tried = filterQualityOrderByDeclared(current, fullOrder).ifEmpty { fullOrder }
         for (q in tried) {
             if (excludeQualities.contains(q)) continue
-            val res = runAbortable { plugin.getMediaSource(item, q) }
-            if (res?.mediaUrl?.startsWith("http", true) == true) {
-                Log.d("BakaPlugin", "解析命中 ${item.platform}:${item.id} quality=$q via ${plugin.platform}")
-                return res to q
+            val res = runAbortable { plugin.getMediaSourceDetailed(current, q) }
+            if (res?.first?.mediaUrl?.startsWith("http", true) == true) {
+                val (media, actual) = res
+                Log.d("BakaPlugin", "解析命中 ${current.platform}:${current.id} quality=$actual(requested=$q) via ${plugin.platform}")
+                return media to actual
             }
         }
         if (!excludeQualities.contains(defaultQualityKey)) {
-            item.qualities[defaultQualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
-                return item.copy(mediaUrl = it) to defaultQualityKey
+            current.qualities[defaultQualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
+                return current.copy(mediaUrl = it) to defaultQualityKey
             }
         }
-        Log.d("BakaPlugin", "解析失败 ${item.platform}:${item.id} tried=$tried excluded=$excludeQualities")
+        Log.d("BakaPlugin", "解析失败 ${current.platform}:${current.id} tried=$tried excluded=$excludeQualities")
         return null
     }
     suspend fun lyric(item: MediaItem): LyricSource? {

@@ -78,6 +78,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // 注册播放控制器监听
         playbackController.addErrorListener { msg ->
+            val cur = nowPlaying
+            // 源错误（403/断连等多为单 CDN 边缘故障）：有备用地址时静默切换，不弹框；
+            // 耗尽才走失败弹窗。解码类错误不适用备用源，直接弹框。
+            val isSourceError = msg.contains("Source error") || msg.contains("2001") || msg.contains("2004")
+            val next = if (cur != null && isSourceError) {
+                cur.backupUrls.firstOrNull { it.startsWith("http", true) && it != cur.mediaUrl }
+            } else null
+            if (cur != null && next != null) {
+                android.util.Log.w("BakaPlayer", "主源失败自动切换备用地址: $msg")
+                val remaining = cur.backupUrls.filter { it != next }
+                val switched = cur.copy(mediaUrl = next, backupUrls = remaining, loading = true)
+                nowPlaying = switched
+                resolvedCache[cur.key]?.let { resolvedCache[cur.key] = switched.copy(loading = false) }
+                runCatching {
+                    playbackController.play(cur.item.copy(mediaUrl = next, mediaHeaders = cur.headers))
+                }.onFailure {
+                    if (nowPlaying?.key == cur.key) nowPlaying = nowPlaying?.copy(loading = false)
+                    playerError = "播放失败：${it.message ?: "无可用音源"}"
+                    playerErrorRetry = false
+                }
+                return@addErrorListener
+            }
             playerError = msg
             playerErrorRetry = true
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
@@ -172,6 +194,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         
         playRequestJob = viewModelScope.launch {
             val defaultPlayQuality = repository.playQuality.first()
+            var resolveEmpty = false
             val np: NowPlaying? = withContext(Dispatchers.IO) {
                 if (item.platform == "BakaMusic") {
                     val url = item.mediaUrl?.takeIf { it.startsWith("http", true) }
@@ -194,9 +217,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (excludeQualities.isEmpty()) resolvedCache[key]?.let { return@withContext it }
                 
                 val resPair = try {
-                    withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
+                    val r = withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
                         sourceService.resolveForPlaybackDetailed(item, defaultPlayQuality, excludeQualities)
                     }
+                    if (r == null) resolveEmpty = true
+                    r
                 } catch (e: Exception) {
                     if (token == playToken) {
                         if (nowPlaying?.key == key) nowPlaying = nowPlaying?.copy(loading = false)
@@ -221,7 +246,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         return@withContext null
                     }
-                NowPlaying(item, url, actualQuality, res.qualities[actualQuality]?.size, res.mediaHeaders).also {
+                // res 由详情补全后的条目拷贝而来（如 bilibili 的完整音质表/rawJson），展示与缓存均用它
+                val displayItem = res.copy(mediaUrl = null, mediaHeaders = emptyMap())
+                val backups = res.backupUrls.filter { it != url }
+                NowPlaying(displayItem, url, actualQuality, res.qualities[actualQuality]?.size, res.mediaHeaders, loading = false, backupUrls = backups).also {
                     resolvedCache[key] = it
                 }
             }
@@ -229,6 +257,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (token != playToken) return@launch
             if (np == null) {
                 if (nowPlaying?.key == "${item.platform}:${item.id}") nowPlaying = nowPlaying?.copy(loading = false)
+                // 解析返回空（非取消/超时异常）时此前无任何提示，只会停在暂停态；此处补齐失败弹窗
+                if (resolveEmpty) { playerError = "该歌曲暂无可用音源"; playerErrorRetry = false }
                 return@launch
             }
             queueIndex = index
@@ -355,13 +385,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
             
-            val np = NowPlaying(item, url, q, res.qualities[q]?.size, res.mediaHeaders)
+            val np = NowPlaying(res.copy(mediaUrl = null, mediaHeaders = emptyMap()), url, q, res.qualities[q]?.size, res.mediaHeaders, loading = false, backupUrls = res.backupUrls.filter { it != url })
             if (resolvedCacheGen == sourceService.dataVersion()) {
                 resolvedCache[itemKey] = np
             }
             nowPlaying = np
             runCatching {
-                playbackController.play(item.copy(mediaUrl = url, mediaHeaders = res.mediaHeaders))
+                playbackController.play(np.item.copy(mediaUrl = url, mediaHeaders = res.mediaHeaders))
             }.onFailure {
                 playError = "播放失败：${it.message}"
                 if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)

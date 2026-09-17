@@ -1,7 +1,7 @@
 package com.bakamusic.android.data
 
 /** 点播解析整体超时：超时终止请求，并按失败原因显示对应的播放提示 */
-const val PLAY_RESOLVE_TIMEOUT_MS = 10_000L
+const val PLAY_RESOLVE_TIMEOUT_MS = 50_000L
 
 /** 当前播放项：已解析地址与实际播放音质，供播放栏/播放页显示 */
 data class NowPlaying(
@@ -12,7 +12,9 @@ data class NowPlaying(
     /** 播放请求头，随地址一起传递给播放器 */
     val headers: Map<String, String> = emptyMap(),
     /** 是否处于解析中：解析中先显示歌曲信息并叠加加载动画 */
-    val loading: Boolean = false
+    val loading: Boolean = false,
+    /** 备用播放地址：主源 403/断连时自动切换，耗尽才弹失败框 */
+    val backupUrls: List<String> = emptyList()
 ) {
     val key: String get() = "${item.platform}:${item.id}"
 }
@@ -74,7 +76,9 @@ data class MediaItem(
     val lyric: LyricSource? = null,
     val qualities: Map<String, QualityInfo> = emptyMap(),
     /** 插件返回的完整原始 JSON，用于回传给 getMediaSource/getLyric */
-    val rawJson: String? = null
+    val rawJson: String? = null,
+    /** 备用播放地址（如 bilibili 的 backupUrl），主源失败时自动切换 */
+    val backupUrls: List<String> = emptyList()
 )
 
 data class QualityInfo(val size: Long? = null, val bitrate: Long? = null, val url: String? = null)
@@ -106,7 +110,7 @@ data class TopListItem(
     val rawJson: String? = null
 )
 
-/** 播放解析请求超时（10s）：与协程取消区分，超时显示 3003 错误弹窗。 */
+/** 播放解析请求超时（50s）：与协程取消区分，超时显示 3003 错误弹窗。 */
 class MediaResolveTimeoutException(message: String) : Exception(message)
 
 /** 插件运行时已被重载/释放：调用方应按平台名重新获取最新适配器重试一次。 */
@@ -119,6 +123,14 @@ interface MusicPlugin {
     val supportedQualities: Set<String>
     suspend fun search(query: String, page: Int): SearchPage<MediaItem>
     suspend fun getMediaSource(item: MediaItem, quality: String): MediaItem?
+    /** 歌曲详情补全（如 bilibili 搜索项 qualities 为空时补音质/封面），不支持返回 null。 */
+    suspend fun getMusicInfo(item: MediaItem): MediaItem? = null
+    /**
+     * 带实际命中音质的播放解析：部分插件会降级返回（如 bilibili 请求 flac 实际命中 320k），
+     * 此时第二分量为插件上报的实际音质键；默认实现沿用请求音质。
+     */
+    suspend fun getMediaSourceDetailed(item: MediaItem, quality: String): Pair<MediaItem, String>? =
+        getMediaSource(item, quality)?.let { it to quality }
     suspend fun getLyric(item: MediaItem): LyricSource?
     suspend fun importMusicSheet(urlLike: String): PlaylistSnapshot?
     /** 榜单分组，不支持的插件返回空列表。 */

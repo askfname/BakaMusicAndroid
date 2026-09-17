@@ -469,12 +469,9 @@ function getTopListDetail(topListItem) {"""
         }
 
         private fun toTopList(obj: JSONObject, groupTitle: String = ""): TopListItem? {
-            val id = when (val raw = obj.opt("id")) {
-                null, JSONObject.NULL -> ""
-                is Number -> raw.toString()
-                is Boolean -> raw.toString()
-                else -> obj.optString("id")
-            }.ifBlank { obj.optString("songid") }.ifBlank { obj.optString("topId").takeIf { it != "0" }.orEmpty() }
+            val id = normalizePluginId(obj.opt("id"))
+                .ifBlank { normalizePluginId(obj.opt("songid")) }
+                .ifBlank { obj.optString("topId").takeIf { it != "0" }.orEmpty() }
             if (id.isBlank()) return null
             val cover = obj.optString("coverImg")
                 .ifBlank { obj.optString("artwork") }
@@ -488,12 +485,14 @@ function getTopListDetail(topListItem) {"""
                 description = obj.optString("description").ifBlank { obj.optString("intro") },
                 coverImg = cover,
                 groupTitle = groupTitle,
-                rawJson = obj.toString()
+                rawJson = runCatching { normalizeIdFields(obj); obj.toString() }.getOrDefault(obj.toString())
             )
         }
 
-        /** 单次播放解析超时：10s，超时抛出 MediaResolveTimeoutException */
-        private val mediaSourceTimeoutMs = 10_000L
+        /** 单次播放解析超时：50s，超时抛出 MediaResolveTimeoutException */
+        private val mediaSourceTimeoutMs = 50_000L
+        /** 详情补全超时：最佳努力，超时返回 null 并直接走播放解析，不阻塞整体 50s 预算 */
+        private val musicInfoTimeoutMs = 10_000L
         /** 未完成的播放解析任务：新请求到来时取消旧任务，避免单线程排队阻塞 */
         private val mediaCalls = ConcurrentHashMap.newKeySet<Future<*>>()
 
@@ -511,12 +510,63 @@ function getTopListDetail(topListItem) {"""
             if (hadRunning) httpBridge.cancelAll()
         }
 
-        override suspend fun getMediaSource(item: MediaItem, quality: String): MediaItem? {
-            preemptMediaCalls()
+        override suspend fun getMediaSource(item: MediaItem, quality: String): MediaItem? =
+            resolveMediaSource(item, quality)?.first
+
+        override suspend fun getMediaSourceDetailed(item: MediaItem, quality: String): Pair<MediaItem, String>? =
+            resolveMediaSource(item, quality)
+
+        /**
+         * 歌曲详情补全：qualities 为空的搜索项（如 bilibili）在播放/下载前先取详情，
+         * 否则音质选择器只能看到 320k 且降级顺序失去依据。超时或失败返回 null。
+         */
+        override suspend fun getMusicInfo(item: MediaItem): MediaItem? {
             val value = try {
-                invoke("getMediaSource", itemJson(item), quality, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
+                invoke("getMusicInfo", itemJson(item), timeoutMs = musicInfoTimeoutMs)
+            } catch (e: TimeoutCancellationException) {
+                return null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                return null
+            }
+            if (value.length() == 0 || value.has("__error")) return null
+            val enriched = toMedia(value)
+            if (enriched.id.isBlank()) return null
+            // 详情为主、旧 rawJson 补漏：bvid/aid/cid/pages 等别名字段缺一不可，否则 getMediaSource 定位失败
+            val mergedRaw = runCatching { JSONObject(value.toString()) }.getOrDefault(JSONObject())
+            runCatching { JSONObject(item.rawJson ?: "{}") }.getOrNull()?.let { old ->
+                old.keys().forEach { key -> if (!mergedRaw.has(key)) mergedRaw.put(key, old.opt(key)) }
+            }
+            normalizeIdFields(mergedRaw)
+            mergedRaw.put("id", item.id)
+            return item.copy(
+                artwork = enriched.artwork ?: item.artwork,
+                durationMs = enriched.durationMs.takeIf { it > 0 } ?: item.durationMs,
+                qualities = enriched.qualities.ifEmpty { item.qualities },
+                backupUrls = enriched.backupUrls.ifEmpty { item.backupUrls },
+                rawJson = mergedRaw.toString()
+            )
+        }
+
+        private suspend fun resolveMediaSource(item: MediaItem, quality: String): Pair<MediaItem, String>? {
+            preemptMediaCalls()
+            val payload = itemJson(item)
+            var value = try {
+                invoke("getMediaSource", payload, quality, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
             } catch (e: TimeoutCancellationException) {
                 throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
+            }
+            // 旧插件仅认识 low/standard/high/super：新音质键无结果时按桌面端映射回退一次
+            if (value.optString("url").isBlank()) {
+                val legacy = legacyQualityOf(quality)
+                if (legacy != null && legacy != quality) {
+                    value = try {
+                        invoke("getMediaSource", payload, legacy, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
+                    } catch (e: TimeoutCancellationException) {
+                        throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
+                    }
+                }
             }
             val url = value.optString("url").takeIf { it.startsWith("http", true) } ?: return null
             // 当前客户端无法解密加密流（cek/ekey），返回 null，由路由继续尝试更低音质
@@ -533,7 +583,11 @@ function getTopListDetail(topListItem) {"""
                 obj.keys().forEach { key -> obj.optString(key).takeIf(String::isNotBlank)?.let { headers[key] = it } }
             }
             value.optString("userAgent").takeIf(String::isNotBlank)?.let { headers.putIfAbsent("User-Agent", it) }
-            return item.copy(mediaUrl = url, mediaHeaders = headers)
+            // 插件可能降级返回（如 bilibili 请求 flac 实际命中 320k）：以上报为准，避免界面音质与实际流不一致
+            val actualQuality = value.optString("quality").trim().takeIf { it.isNotEmpty() } ?: quality
+            // 本次解析返回的备用 CDN 随条目透出，播放失败时自动切换
+            val backups = parseBackupUrls(value).ifEmpty { item.backupUrls }
+            return item.copy(mediaUrl = url, mediaHeaders = headers, backupUrls = backups) to actualQuality
         }
 
         override suspend fun getLyric(item: MediaItem): LyricSource? {
@@ -694,15 +748,73 @@ function getTopListDetail(topListItem) {"""
 
         fun close() { if (closed) return; closed = true; runCatching { context.close() }; runCatching { quick.close() } }
 
+        /**
+         * JS 数值经 QuickJS→JSONObject 桥接后，大 id 会变成 Double，
+         * optString/toString 会得到科学计数法（如 3.342319503E9）或带 .0 后缀，
+         * 回传给插件请求 API 时服务端返回 No URL。桌面端（Node 内 String(id)）不存在此问题。
+         * 此处统一还原为纯整数文本；hash 等非纯数字标识不受影响。
+         */
+        private fun normalizePluginId(raw: Any?): String {
+            if (raw == null || raw == JSONObject.NULL) return ""
+            if (raw is Boolean) return raw.toString()
+            if (raw is Number) {
+                return runCatching {
+                    val plain = java.math.BigDecimal(raw.toString()).toPlainString()
+                    if (plain.contains('.')) plain.trimEnd('0').trimEnd('.').ifEmpty { "0" } else plain
+                }.getOrDefault(raw.toLong().toString())
+            }
+            val s = raw.toString().trim()
+            if (s.isEmpty()) return ""
+            if (s.matches(Regex("^[0-9]+(\\.[0-9]+)?[eE][+-]?[0-9]+$"))) {
+                return runCatching {
+                    val plain = java.math.BigDecimal(s).toPlainString()
+                    if (plain.contains('.')) plain.trimEnd('0').trimEnd('.').ifEmpty { "0" } else plain
+                }.getOrDefault(s)
+            }
+            if (s.matches(Regex("^[0-9]+\\.0+$"))) return s.substringBefore('.')
+            return s
+        }
+
+        /** 备用 CDN（如 bilibili backupUrl/backupUrls）：主源 403/断连时播放器侧自动切换 */
+        private fun parseBackupUrls(obj: JSONObject): List<String> = buildList {
+            fun addUrl(v: Any?) { if (v is String && v.startsWith("http", true)) add(v) }
+            listOf(obj.opt("backupUrls"), obj.opt("backupUrl")).forEach { field ->
+                when (field) {
+                    is JSONArray -> for (i in 0 until field.length()) addUrl(field.opt(i))
+                    is String -> addUrl(field)
+                }
+            }
+        }.distinct().take(3)
+
+        /** 修复回传 JSON 中易被科学计数法污染的歌曲标识字段（含已持久化的旧快照）。 */
+        private fun normalizeIdFields(obj: JSONObject) {            val keys = arrayOf("id", "songmid", "songid", "mid", "copyrightId", "albumId", "album_id")
+            for (key in keys) {
+                if (!obj.has(key) || obj.isNull(key)) continue
+                val fixed = normalizePluginId(obj.opt(key))
+                if (fixed.isNotEmpty()) obj.put(key, fixed)
+            }
+        }
+
+        /** 新音质→旧插件兼容音质键（与桌面端 newToLegacyQualityMap 一致），旧插件无此概念时返回 null。 */
+        private fun legacyQualityOf(key: String): String? = when (key) {
+            "96k", "128k" -> "low"
+            "192k" -> "standard"
+            "320k" -> "high"
+            "flac", "flac24bit", "hires", "vinyl", "dolby", "atmos", "atmos_plus", "master" -> "super"
+            else -> null
+        }
+
         /** 榜单条目回传插件：保留原始字段供插件定位榜单 */
         private fun topListJson(item: TopListItem) = runCatching { if (item.rawJson != null) JSONObject(item.rawJson) else JSONObject() }.getOrDefault(JSONObject()).apply {
-            put("id", item.id); put("platform", item.platform.ifBlank { platformName }); put("title", item.title)
+            normalizeIdFields(this)
+            put("id", normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform.ifBlank { platformName }); put("title", item.title)
             if (!has("coverImg") && item.coverImg != null) put("coverImg", item.coverImg)
             if (!has("description") && item.description.isNotBlank()) put("description", item.description)
         }
 
         private fun itemJson(item: MediaItem) = runCatching { if (item.rawJson != null) JSONObject(item.rawJson) else JSONObject() }.getOrDefault(JSONObject()).apply {
-            put("id", item.id); put("platform", item.platform); put("title", item.title); put("artist", item.artist); put("album", item.album)
+            normalizeIdFields(this)
+            put("id", normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform); put("title", item.title); put("artist", item.artist); put("album", item.album)
             // 补充秒级单位的 duration 字段，确保 rawJson 缺失时插件仍可获取时长
             if (!has("duration") && item.durationMs > 0) put("duration", item.durationMs / 1000)
             if (!has("durationMs") && item.durationMs > 0) put("durationMs", item.durationMs)
@@ -737,8 +849,10 @@ function getTopListDetail(topListItem) {"""
                 }
             }
             val duration = obj.optDouble("duration", 0.0)
+            // 备用 CDN（如 bilibili backupUrl）：主源 403/断连时播放器侧自动切换
+            val backups = parseBackupUrls(obj)
             return MediaItem(
-            id = obj.optString("id").ifBlank { obj.optString("songmid") }.ifBlank { obj.optString("songid") },
+            id = normalizePluginId(obj.opt("id")).ifBlank { normalizePluginId(obj.opt("songmid")) }.ifBlank { normalizePluginId(obj.opt("songid")) },
             platform = obj.optString("platform").ifBlank { platformName },
             title = obj.optString("title").ifBlank { obj.optString("songname") },
             artist = obj.optString("artist").ifBlank { obj.optString("singer") },
@@ -748,7 +862,8 @@ function getTopListDetail(topListItem) {"""
             durationMs = if (duration > 10000) duration.toLong() else (duration * 1000).toLong(),
             mediaUrl = obj.optString("url").takeIf { it.startsWith("http", true) },
             qualities = qualities,
-            rawJson = obj.toString()
+            rawJson = runCatching { normalizeIdFields(obj); obj.toString() }.getOrDefault(obj.toString()),
+            backupUrls = backups
             )
         }
 

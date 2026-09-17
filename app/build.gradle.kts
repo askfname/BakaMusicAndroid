@@ -1,12 +1,11 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "com.bakamusic.android"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.bakamusic.android"
@@ -49,9 +48,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+
     ndkVersion = "26.0.10792818"
     buildToolsVersion = "36.0.0"
 }
@@ -60,15 +57,15 @@ dependencies {
     // QuickJS avoids one Chromium instance per plugin. Calls are serialized by
     // the runtime wrapper; the host exposes only the restricted plugin bridge.
     implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6")
-    implementation(platform("androidx.compose:compose-bom:2025.01.00"))
-    implementation("androidx.activity:activity-compose:1.10.0")
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
+    implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
-    implementation("androidx.media3:media3-exoplayer:1.5.1")
-    implementation("androidx.media3:media3-session:1.5.1")
-    implementation("androidx.media3:media3-common:1.5.1")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
+    implementation("androidx.datastore:datastore-preferences:1.2.1")
+    implementation("androidx.media3:media3-exoplayer:1.11.1")
+    implementation("androidx.media3:media3-session:1.11.1")
+    implementation("androidx.media3:media3-common:1.11.1")
     implementation("io.coil-kt:coil-compose:2.7.0")
 }
