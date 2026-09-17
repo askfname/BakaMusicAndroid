@@ -137,7 +137,7 @@ class QuickJsPluginRuntime(private val manager: PluginManager) {
             // 所用 QuickJS 绑定不支持异步任务，插件源码需剥离 async/await 为同步调用
             //（配套的同步 Promise 兼容实现见 runtimeBootstrap）。
             context.executeVoidScript(runtimeBootstrap(), "quickjs-runtime.js")
-            val wrappedSource = "var exports = module.exports;\n${patchKuwoTopListDetail(patchNeteaseSearchBloat(source))}"
+            val wrappedSource = "var exports = module.exports;\n${patchQishuiPlayback(patchKuwoTopListDetail(patchNeteaseSearchBloat(source)))}"
             val module = context.executeModuleScript(stripAsyncAwait(wrappedSource), "${metadata.name}.js")
             // 缺失的导出键返回 Undefined 而非 null，仅当 default 为有效对象时使用
             val exportsObj = module.getObject("exports")?.takeIf { !it.isUndefined }
@@ -236,6 +236,18 @@ function getTopListDetail(topListItem) {"""
                 "const rawDuration = item?.song_duration ?? item?.duration ?? item?.DURATION ?? item?.songtime;"
             )
             return out
+        }
+
+        /**
+         * 汽水播放补丁：取流内层 3 次重试改为单次，外层 Router 已按音质循环重试，
+         * 内层重复签名+取流只会串行放大耗时直至 50s 超时。仅修改运行时加载的源码副本。
+         */
+        private fun patchQishuiPlayback(source: String): String {
+            if (!source.contains("fetchTrackPlaybackData") || !source.contains("QISHUI_ANDROID_TRACK_BODY_TEMPLATE")) return source
+            return source.replace(
+                "for (let attempt = 1; attempt <= 3; attempt++)",
+                "for (let attempt = 1; attempt <= 1; attempt++)"
+            )
         }
 
         /**
@@ -869,6 +881,10 @@ function getTopListDetail(topListItem) {"""
 
         private inner class HttpBridge {
             private val open = ConcurrentHashMap.newKeySet<HttpURLConnection>()
+            /** host 熔断：连续传输层失败 2 次后 60s 内直接快速失败（签名服务挂掉时不再每首歌烧 10s）。 */
+            private val hostFailStreak = ConcurrentHashMap<String, Int>()
+            private val hostBreakerUntil = ConcurrentHashMap<String, Long>()
+            private val breakerWindowMs = 60_000L
 
             fun cancelAll() { open.toList().forEach { runCatching { it.disconnect() } }; open.clear() }
 
@@ -878,7 +894,20 @@ function getTopListDetail(topListItem) {"""
                     return JSONObject().put("__error", "插件请求并发数超限").toString()
                 }
                 return try {
-                    runCatching {
+                    runCatching { executeWithRetry(configText) }
+                        .getOrElse { JSONObject().put("__error", it.message ?: "network error").toString() }
+                } finally {
+                    requestSlots.release()
+                }
+            }
+
+            /**
+             * 插件 HTTP 执行：首试复用连接，遇连接复用类错误
+             * （unexpected end of stream / Connection reset）时用 Connection:close 再试一次。
+             * OkHttp 连接池复用的半关闭连接是汽水 track_v2 高频 RST 的主因
+             * （同插件 Dart 客户端走 HTTP/1.1 无此问题）。
+             */
+            private fun executeWithRetry(configText: String): String {
                 val config = JSONObject(configText)
                 var url = encodeUrlInline(config.getString("url"))
                 config.optJSONObject("params")?.let { params ->
@@ -897,72 +926,185 @@ function getTopListDetail(topListItem) {"""
                 require(!isPluginPrivateHost(host)) { "插件不能访问本机或内网地址" }
                 val method = config.optString("method", "GET").uppercase()
                 val isBinary = config.optString("responseType").equals("arraybuffer", true) || config.optString("responseType").equals("blob", true)
-                val conn = URI(url).toURL().openConnection() as HttpURLConnection
-                open.add(conn)
-                try {
-                    conn.connectTimeout = 15_000; conn.readTimeout = 15_000; conn.instanceFollowRedirects = true
-                    conn.requestMethod = method
-                    val headers = config.optJSONObject("headers")
-                    headers?.keys()?.forEach { key -> conn.setRequestProperty(key, headers.optString(key)) }
-                    val data = config.opt("data")
-                    if (data != null && data != JSONObject.NULL && conn.requestMethod !in setOf("GET", "HEAD")) {
-                    conn.doOutput = true
-                    // 请求头名称大小写不敏感，需遍历匹配 Content-Type
-                    var contentType = ""
-                    headers?.keys()?.forEach { key ->
-                        if (key.equals("Content-Type", true)) contentType = headers.optString(key).orEmpty()
+                // 尊重 JS 指定的超时（如 track_v2 20s），钳制在 3s~60s；整体仍受上层 50s 预算约束
+                val timeoutMs = runCatching { config.optInt("timeout", 15_000) }.getOrDefault(15_000).coerceIn(3_000, 60_000)
+                val headers = config.optJSONObject("headers")
+                val data = config.opt("data")
+                val hasBody = data != null && data != JSONObject.NULL && method !in setOf("GET", "HEAD")
+                // 请求头名称大小写不敏感，需遍历匹配 Content-Type
+                var contentType = ""
+                headers?.keys()?.forEach { key ->
+                    if (key.equals("Content-Type", true)) contentType = headers.optString(key).orEmpty()
+                }
+                // body 预先算好，重试时复用同一字节（签名已绑定 body，重试不得改变内容）
+                var bodyKind = "none"
+                val bodyBytes: ByteArray? = if (!hasBody) null else when {
+                    // Uint8Array/Buffer 经 axios 桥接为 {__bytes_base64} 或数字键对象，需还原为原始字节；
+                    // 否则 JSON.stringify(Uint8Array) 会变成 {"0":..}，服务端直接断连。
+                    data is JSONObject && data.has("__bytes_base64") -> {
+                        bodyKind = "bytes"
+                        android.util.Base64.decode(data.optString("__bytes_base64"), android.util.Base64.DEFAULT)
                     }
-                    if (contentType.isBlank()) conn.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
-                    // 当 Content-Type 为表单类型且 data 为对象时进行 urlencoded 序列化；字符串 data 直接发送
-                    val bodyBytes = if (data is JSONObject && contentType.contains("x-www-form-urlencoded", true)) {
+                    data is JSONObject && isUint8ArrayJson(data) -> {
+                        bodyKind = "bytes"
+                        uint8ArrayJsonToBytes(data)
+                    }
+                    data is JSONObject && contentType.contains("x-www-form-urlencoded", true) -> {
+                        bodyKind = "form"
                         formEncode(data).toByteArray()
-                    } else {
+                    }
+                    data is JSONObject -> {
+                        bodyKind = "json"
                         data.toString().toByteArray()
                     }
-                    conn.outputStream.use { it.write(bodyBytes) }
+                    else -> {
+                        bodyKind = "raw"
+                        data.toString().toByteArray()
+                    }
                 }
-                val code = conn.responseCode
-                val finalUrl = conn.url?.toString() ?: url
-                require(finalUrl.startsWith("http://", true) || finalUrl.startsWith("https://", true)) { "插件重定向地址无效" }
-                val finalHost = URI(finalUrl).host?.lowercase() ?: throw IllegalArgumentException("插件重定向地址无效")
-                require(!isPluginPrivateHost(finalHost)) { "插件不能重定向到本机或内网地址" }
-                val input = if (code in 200..299) conn.inputStream else (conn.errorStream ?: conn.inputStream)
-                require(conn.contentLengthLong <= 16L * 1024 * 1024 || conn.contentLengthLong < 0) { "响应超过 16 MiB 限制" }
-                val encoding = (conn.contentEncoding ?: "").lowercase()
-                val decoded = when {
-                    encoding.contains("gzip") -> java.util.zip.GZIPInputStream(input)
-                    encoding.contains("deflate") -> java.util.zip.InflaterInputStream(input)
-                    else -> input
+                val hostPath = host + runCatching { URI(url).path }.getOrDefault("")
+                // 熔断：该 host 连续传输层失败后快速失败，不在已死的签名服务上烧预算
+                if ((hostBreakerUntil[host] ?: 0L) > System.currentTimeMillis()) {
+                    Log.d("BakaPlugin", "[$platformName][http] $method $hostPath 熔断快速失败")
+                    return JSONObject().put("__error", "网络暂不可用，快速回落").toString()
                 }
-                val bytes = decoded.use { stream ->
-                    readLimited(stream, 16 * 1024 * 1024)
+                var lastError: Throwable? = null
+                for (attempt in 0..1) {
+                    try {
+                        val result = exchangeOnce(
+                            url, hostPath, method, headers, contentType,
+                            bodyBytes, bodyKind, hasBody, isBinary, timeoutMs,
+                            closeConnection = attempt == 1
+                        )
+                        hostFailStreak.remove(host)
+                        hostBreakerUntil.remove(host)
+                        return result
+                    } catch (e: Throwable) {
+                        // 切歌取消导致的断连是预期行为，直接抛出且不计入熔断
+                        if (isIntentionalCancel(e)) throw e
+                        if (isRetryableNetworkError(e)) {
+                            val streak = (hostFailStreak[host] ?: 0) + 1
+                            hostFailStreak[host] = streak
+                            if (streak >= 2) hostBreakerUntil[host] = System.currentTimeMillis() + breakerWindowMs
+                        }
+                        if (attempt == 1 || !isRetryableNetworkError(e)) throw e
+                        lastError = e
+                        Log.w("BakaPlugin", "[$platformName][http] $method $hostPath 失败重试: ${e.message}")
+                    }
                 }
-                val body = String(bytes, Charsets.UTF_8)
-                val dataValue = if (isBinary) {
-                    JSONObject().put("__base64", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
-                } else {
-                    // 仅对类 JSON 响应体进行解析，其余（如 JSONP 或纯 LRC 文本）直接返回字符串
-                    val trimmed = body.trimStart()
-                    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                        runCatching { JSONTokener(body).nextValue() }.getOrElse { body }
-                    } else body
-                }
-                val responseHeaders = JSONObject()
-                conn.headerFields.forEach { (key, values) ->
-                    if (!key.isNullOrBlank() && !values.isNullOrEmpty()) responseHeaders.put(key, values.joinToString(","))
-                }
-                JSONObject().put("status", code).put("headers", responseHeaders).put("data", dataValue).toString()
+                throw lastError ?: IllegalStateException("network error")
+            }
+
+            private fun exchangeOnce(
+                url: String,
+                hostPath: String,
+                method: String,
+                headers: JSONObject?,
+                contentType: String,
+                bodyBytes: ByteArray?,
+                bodyKind: String,
+                hasBody: Boolean,
+                isBinary: Boolean,
+                timeoutMs: Int,
+                closeConnection: Boolean
+            ): String {
+                val conn = URI(url).toURL().openConnection() as HttpURLConnection
+                open.add(conn)
+                val start = System.currentTimeMillis()
+                try {
+                    conn.connectTimeout = timeoutMs; conn.readTimeout = timeoutMs; conn.instanceFollowRedirects = true
+                    conn.requestMethod = method
+                    var hasConnectionHeader = false
+                    headers?.keys()?.forEach { key ->
+                        if (key.equals("Connection", true)) hasConnectionHeader = true
+                        conn.setRequestProperty(key, headers.optString(key))
+                    }
+                    // 重试时禁用 keep-alive 复用，强制走新连接
+                    if (closeConnection && !hasConnectionHeader) conn.setRequestProperty("Connection", "close")
+                    if (hasBody && bodyBytes != null) {
+                        conn.doOutput = true
+                        if (contentType.isBlank()) conn.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
+                        conn.outputStream.use { it.write(bodyBytes) }
+                    }
+                    val code = conn.responseCode
+                    val finalUrl = conn.url?.toString() ?: url
+                    require(finalUrl.startsWith("http://", true) || finalUrl.startsWith("https://", true)) { "插件重定向地址无效" }
+                    val finalHost = URI(finalUrl).host?.lowercase() ?: throw IllegalArgumentException("插件重定向地址无效")
+                    require(!isPluginPrivateHost(finalHost)) { "插件不能重定向到本机或内网地址" }
+                    val input = if (code in 200..299) conn.inputStream else (conn.errorStream ?: conn.inputStream)
+                    require(conn.contentLengthLong <= 16L * 1024 * 1024 || conn.contentLengthLong < 0) { "响应超过 16 MiB 限制" }
+                    val encoding = (conn.contentEncoding ?: "").lowercase()
+                    val decoded = when {
+                        encoding.contains("gzip") -> java.util.zip.GZIPInputStream(input)
+                        encoding.contains("deflate") -> java.util.zip.InflaterInputStream(input)
+                        else -> input
+                    }
+                    val bytes = decoded.use { stream ->
+                        readLimited(stream, 16 * 1024 * 1024)
+                    }
+                    val body = String(bytes, Charsets.UTF_8)
+                    val dataValue = if (isBinary) {
+                        JSONObject().put("__base64", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+                    } else {
+                        // 仅对类 JSON 响应体进行解析，其余（如 JSONP 或纯 LRC 文本）直接返回字符串
+                        val trimmed = body.trimStart()
+                        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                            runCatching { JSONTokener(body).nextValue() }.getOrElse { body }
+                        } else body
+                    }
+                    val responseHeaders = JSONObject()
+                    conn.headerFields.forEach { (key, values) ->
+                        if (!key.isNullOrBlank() && !values.isNullOrEmpty()) responseHeaders.put(key, values.joinToString(","))
+                    }
+                    val ms = System.currentTimeMillis() - start
+                    if (method == "POST" || ms > 2000) {
+                        Log.d("BakaPlugin", "[$platformName][http] $method $hostPath code=$code ${ms}ms req=${bodyBytes?.size ?: 0}B($bodyKind) resp=${bytes.size}B")
+                    }
+                    return JSONObject().put("status", code).put("headers", responseHeaders).put("data", dataValue).toString()
                 } finally {
                     open.remove(conn)
                     runCatching { conn.disconnect() }
                 }
-                    }.getOrElse { JSONObject().put("__error", it.message ?: "network error").toString() }
-                } finally {
-                    requestSlots.release()
-                }
+            }
+
+            /** 切歌取消/超时取消导致的断连是预期行为，不重试。 */
+            private fun isIntentionalCancel(e: Throwable): Boolean {
+                if (e is CancellationException || e is InterruptedException) return true
+                val msg = (e.message ?: "").lowercase()
+                return msg.contains("socket closed") || msg.contains("thread interrupted") ||
+                    msg.contains("canceled") || msg.contains("cancelled")
+            }
+
+            /** 仅传输层偶发错误重试一次（均为幂等读请求）；HTTP 状态码错误由 JS 层按插件逻辑处理。 */
+            private fun isRetryableNetworkError(e: Throwable): Boolean {
+                if (e is java.net.SocketTimeoutException) return true
+                if (e is java.net.ConnectException) return true
+                if (e is java.io.EOFException) return true
+                val msg = (e.message ?: "").lowercase()
+                return msg.contains("unexpected end of stream") ||
+                    msg.contains("connection reset") || msg.contains("econnreset") ||
+                    msg.contains("epipe") || msg.contains("broken pipe")
             }
 
             private fun valueList(value: JSONArray): List<Any?> = List(value.length()) { value.opt(it) }
+
+            /** JSON.stringify(Uint8Array) 会序列化为 {"0":..,"1":..} 的纯数字键对象，与正常 JSON 请求体区分。 */
+            private fun isUint8ArrayJson(obj: JSONObject): Boolean {
+                val keys = obj.keys().asSequence().toList()
+                if (keys.isEmpty() || keys.size > 8 * 1024 * 1024) return false
+                return keys.all { key -> key.isNotEmpty() && key.all(Char::isDigit) }
+            }
+
+            /** 将数字键对象按索引排序还原为原始字节（越界值按低 8 位截断，与 Uint8Array 语义一致）。 */
+            private fun uint8ArrayJsonToBytes(obj: JSONObject): ByteArray {
+                val keys = obj.keys().asSequence().toList()
+                val indices = keys.mapNotNull(String::toIntOrNull).sorted()
+                val out = ByteArray(indices.size)
+                for (i in indices.indices) {
+                    out[i] = (obj.optInt(indices[i].toString(), 0) and 0xFF).toByte()
+                }
+                return out
+            }
 
             /** URL 仅编码非法字符，保留已有百分号编码。 */
             private fun encodeUrlInline(raw: String): String {
@@ -1226,7 +1368,7 @@ function getTopListDetail(topListItem) {"""
 
         private fun moduleScripts(): Map<String, String> = mapOf(
             "axios" to """
-                var axios=function(c){var cfg=c||{};var r=JSON.parse(BakaHttp.request(JSON.stringify(cfg)));if(r.__error)throw new Error(r.__error);var ok=cfg.validateStatus?cfg.validateStatus(r.status):r.status>=200&&r.status<300;if(!ok){var err=new Error('Request failed with status code '+r.status);err.response={status:r.status,data:r.data,headers:r.headers||{}};throw err;}var d=r.data;var tr=cfg.transformResponse;if(tr){var fns=Array.isArray(tr)?tr:[tr];for(var i=0;i<fns.length;i++){if(typeof fns[i]==='function')d=fns[i](d);}}if(d&&d.__base64){var raw=atob(d.__base64),u=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);d=u;}return {data:d,status:r.status,statusText:String(r.status),headers:r.headers||{},config:cfg};};
+                var axios=function(c){var cfg=c||{};var __d=cfg&&cfg.data;if(__d&&typeof Uint8Array!=='undefined'&&__d instanceof Uint8Array){var __bin='';for(var __i=0;__i<__d.length;__i++)__bin+=String.fromCharCode(__d[__i]);try{cfg=Object.assign({},cfg,{data:{__bytes_base64:btoa(__bin)}});}catch(__e){}}var r=JSON.parse(BakaHttp.request(JSON.stringify(cfg)));if(r.__error)throw new Error(r.__error);var ok=cfg.validateStatus?cfg.validateStatus(r.status):r.status>=200&&r.status<300;if(!ok){var err=new Error('Request failed with status code '+r.status);err.response={status:r.status,data:r.data,headers:r.headers||{}};throw err;}var d=r.data;var tr=cfg.transformResponse;if(tr){var fns=Array.isArray(tr)?tr:[tr];for(var i=0;i<fns.length;i++){if(typeof fns[i]==='function')d=fns[i](d);}}if(d&&d.__base64){var raw=atob(d.__base64),u=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);d=u;}return {data:d,status:r.status,statusText:String(r.status),headers:r.headers||{},config:cfg};};
                 axios.request=axios;axios.get=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'GET'}));};axios.post=function(u,d,c){return axios(Object.assign({},c||{},{url:u,method:'POST',data:d}));};axios.head=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'HEAD'}));};axios.getUri=function(c){c=c||{};var u=c.url||'';var p=c.params||{};var q=Object.keys(p).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(p[k]);}).join('&');return q?(u+(u.indexOf('?')>=0?'&':'?')+q):u;};axios.all=function(values){return Promise.all(values);};axios.spread=function(fn){return function(values){return fn.apply(null,values);};};axios.default=axios;axios.create=function(def){var inst=function(c){return axios(Object.assign({},def||{},c||{}));};inst.get=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'GET'}));};inst.post=function(u,d,c){return inst(Object.assign({},c||{},{url:u,method:'POST',data:d}));};inst.head=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'HEAD'}));};inst.request=inst;return inst;};module.exports=axios;
             """.trimIndent(),
             "buffer" to "module.exports={Buffer:globalThis.Buffer};",
