@@ -10,11 +10,20 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -29,14 +38,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.compose.ui.window.DialogWindowProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.bakamusic.android.data.*
@@ -74,6 +82,8 @@ class MainActivity : ComponentActivity() {
 }
 
 private fun hideSystemBars(window: Window) {
+    window.statusBarColor = android.graphics.Color.TRANSPARENT
+    window.navigationBarColor = android.graphics.Color.TRANSPARENT
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         window.setDecorFitsSystemWindows(false)
         window.insetsController?.let { controller ->
@@ -103,25 +113,6 @@ private fun showSystemBars(window: Window) {
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
             )
-    }
-}
-
-@Composable private fun FullscreenImmersiveEffect() {
-    val view = LocalView.current
-    DisposableEffect(view) {
-        var ctx: android.content.Context? = view.context
-        var activity: Activity? = null
-        while (ctx is android.content.ContextWrapper) {
-            if (ctx is Activity) { activity = ctx; break }
-            ctx = ctx.baseContext
-        }
-        val activityWindow = activity?.window
-        val dialogWindow = (view.parent as? DialogWindowProvider)?.window
-        val windows = listOfNotNull(activityWindow, dialogWindow)
-        windows.forEach { hideSystemBars(it) }
-        onDispose {
-            windows.forEach { showSystemBars(it) }
-        }
     }
 }
 
@@ -266,13 +257,58 @@ private fun showSystemBars(window: Window) {
     )
 
     if (lyricFullscreen) {
-        Dialog(
-            onDismissRequest = { lyricFullscreen = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+        val lyricTransition = remember { MutableTransitionState(false).apply { targetState = true } }
+        fun dismissLyricAnimated() {
+            if (lyricTransition.targetState) lyricTransition.targetState = false
+        }
+        // 退出动画播完才真正关闭
+        LaunchedEffect(lyricTransition.currentState, lyricTransition.isIdle) {
+            if (!lyricTransition.targetState && !lyricTransition.currentState && lyricTransition.isIdle) {
+                lyricFullscreen = false
+            }
+        }
+        // 全屏覆盖层（Activity 窗口内）：独立 Dialog 建窗时系统栏先显后隐会闪烁，故不用 Dialog
+        BackHandler { dismissLyricAnimated() }
+        // 与音乐播放器界面一样的封面取色对角线渐变背景（含切换时的平滑过渡）
+        val (lyricGradientStart, lyricGradientEnd) = rememberCoverGradientColors(viewModel.nowPlaying?.item?.artwork)
+        val lyricLight = (lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.65f
+        val lyricOverlayView = LocalView.current
+        val lyricDarkTheme = isSystemInDarkTheme()
+        DisposableEffect(lyricOverlayView, lyricLight, lyricDarkTheme) {
+            var lyricCtx: android.content.Context? = lyricOverlayView.context
+            var lyricActivity: Activity? = null
+            while (lyricCtx is android.content.ContextWrapper) {
+                if (lyricCtx is Activity) { lyricActivity = lyricCtx; break }
+                lyricCtx = lyricCtx.baseContext
+            }
+            val lyricWindow = lyricActivity?.window
+            lyricWindow?.let { hideSystemBars(it); applyGradientBarIcons(it, lyricLight) }
+            onDispose {
+                // 底下播放器覆盖层仍开着，恢复成与它一致的渐变图标色，而不是主题默认，否则会反转
+                lyricWindow?.let { showSystemBars(it); applyGradientBarIcons(it, lyricLight) }
+            }
+        }
+        Box(
+            Modifier.fillMaxSize()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {}
+                )
         ) {
-            FullscreenImmersiveEffect()
-            // 与音乐播放器界面一样的封面取色对角线渐变背景（含切换时的平滑过渡）
-            val (lyricGradientStart, lyricGradientEnd) = rememberCoverGradientColors(viewModel.nowPlaying?.item?.artwork)
+            // 打开首帧快照一次导航栏高度并永久冻结，进入动画隐藏系统栏时内容不再上跳
+            val lyricDensity = LocalDensity.current
+            var frozenLyricNavBottom by remember { mutableStateOf<Dp?>(null) }
+            if (frozenLyricNavBottom == null) {
+                frozenLyricNavBottom = with(lyricDensity) {
+                    androidx.compose.foundation.layout.WindowInsets.navigationBars.getBottom(lyricDensity).toDp()
+                }
+            }
+            AnimatedVisibility(
+                visibleState = lyricTransition,
+                enter = fadeIn(animationSpec = tween(300)) + slideInVertically(initialOffsetY = { it }, animationSpec = tween(300)),
+                exit = fadeOut(animationSpec = tween(250)) + scaleOut(targetScale = 0.96f, animationSpec = tween(250))
+            ) {
             val lyricGradientBrush = remember(lyricGradientStart, lyricGradientEnd) {
                 Brush.linearGradient(
                     colors = listOf(lyricGradientStart, lyricGradientEnd),
@@ -281,13 +317,13 @@ private fun showSystemBars(window: Window) {
                 )
             }
             val lyricContentTarget =
-                if ((lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.5f) Color.Black else Color.White
+                if ((lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.65f) Color.Black else Color.White
             val lyricSubTarget = lyricContentTarget.copy(alpha = 0.7f)
             val lyricContent by animateColorAsState(targetValue = lyricContentTarget, animationSpec = tween(600), label = "lyricContent")
             val lyricSubContent by animateColorAsState(targetValue = lyricSubTarget, animationSpec = tween(600), label = "lyricSubContent")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(lyricGradientBrush)) {
-                Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp)) {
+                Column(Modifier.fillMaxSize().padding(bottom = frozenLyricNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 24.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("歌词", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = lyricContent)
@@ -297,7 +333,7 @@ private fun showSystemBars(window: Window) {
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                         }
-                        IconButton(onClick = { lyricFullscreen = false }) { Icon(Icons.Default.FullscreenExit, "退出全屏", tint = lyricContent) }
+                        IconButton(onClick = { dismissLyricAnimated() }) { Icon(Icons.Default.FullscreenExit, "退出全屏", tint = lyricContent) }
                     }
                     Spacer(Modifier.height(8.dp))
                     Box(Modifier.fillMaxWidth().weight(1f)) {
@@ -314,6 +350,7 @@ private fun showSystemBars(window: Window) {
                     }
                 }
                 }
+            }
             }
         }
     }

@@ -4,6 +4,7 @@ import com.bakamusic.android.data.*
 import com.bakamusic.android.service.*
 import com.bakamusic.android.plugin.*
 import com.bakamusic.android.util.*
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.CubicBezierEasing
@@ -14,6 +15,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
@@ -39,12 +42,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -53,6 +54,10 @@ import coil.compose.rememberAsyncImagePainter
 import coil.imageLoader
 import com.bakamusic.android.*
 import kotlinx.coroutines.*
+import android.os.Build
+import android.view.View
+import android.view.Window
+import android.view.WindowInsetsController
 
 @Composable fun MiniPlayer(
     now: NowPlaying?, playing: Boolean, buffering: Boolean,
@@ -76,7 +81,7 @@ import kotlinx.coroutines.*
         }.getOrNull()
     }
     val containerColor = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
-    val contentColor = if (containerColor.luminance() > 0.5f) Color.Black else Color.White
+    val contentColor = if (containerColor.luminance() > 0.65f) Color.Black else Color.White
     val subContentColor = contentColor.copy(alpha = 0.7f)
     val buttonTint = if (enabled) contentColor else contentColor.copy(alpha = 0.38f)
     val progress = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
@@ -209,20 +214,41 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
     }.getOrNull()
 }
 
+private const val COVER_GRADIENT_CACHE_MAX = 60
+
+// 封面渐变内存缓存（仅主线程读写）：播放器与全屏歌词共用同一 artwork 时直接命中。
+// lastResolvedGradient 保证切换封面时从旧色直切新色，不经过默认色。
+private val coverGradientCache = object : LinkedHashMap<String, Pair<Color, Color>>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Color, Color>>): Boolean =
+        size > COVER_GRADIENT_CACHE_MAX
+}
+private var lastResolvedGradient: Pair<Color, Color>? = null
+
 @Composable fun rememberCoverGradientColors(artwork: String?): Pair<Color, Color> {
     val defaultStart = MaterialTheme.colorScheme.secondaryContainer
     val defaultEnd = MaterialTheme.colorScheme.surfaceContainerLow
-    var raw by remember(artwork) { mutableStateOf<Pair<Color, Color>?>(null) }
+    // 同步读缓存作为初值：命中时首帧即取色结果，不会先提交一帧默认色；
+    // 未命中则沿用上次解出的颜色，切歌时从旧色直接过渡到新色。
+    var raw by remember(artwork) {
+        mutableStateOf(
+            if (artwork.isNullOrBlank()) null
+            else (coverGradientCache[artwork] ?: lastResolvedGradient)
+        )
+    }
     val context = LocalContext.current
     LaunchedEffect(artwork) {
-        if (artwork.isNullOrBlank()) {
+        val key = artwork
+        if (key.isNullOrBlank()) {
             raw = null
+            lastResolvedGradient = null
             return@LaunchedEffect
         }
-        // 注意：之前用未挂载到 Image() 的 rememberAsyncImagePainter 取 drawable，
-        // Coil 需布局尺寸才能解析请求而不执行，导致一直回退到主题色。
-        // 改为 ImageLoader.execute() 直接在 IO 线程加载解析。
-        raw = withContext(Dispatchers.IO) {
+        coverGradientCache[key]?.let {
+            raw = it
+            lastResolvedGradient = it
+            return@LaunchedEffect
+        }
+        val loaded = withContext(Dispatchers.IO) {
             runCatching {
                 val request = coil.request.ImageRequest.Builder(context)
                     .data(artwork)
@@ -232,6 +258,13 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
                 val drawable = (result as? coil.request.SuccessResult)?.drawable ?: return@runCatching null
                 drawableToMiniPlayerBitmap(drawable)?.let { gradientColorsFromCoverBitmap(it) }
             }.getOrNull()
+        }
+        if (loaded != null) {
+            coverGradientCache[key] = loaded
+            lastResolvedGradient = loaded
+            raw = loaded
+        } else {
+            raw = null
         }
     }
     val targetStart = raw?.first ?: defaultStart
@@ -245,6 +278,43 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
     val (start, end) = rememberCoverGradientColors(artwork)
     return remember(start, end) {
         Brush.linearGradient(colors = listOf(start, end), start = Offset.Zero, end = Offset.Infinite)
+    }
+}
+
+internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+            WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        window.insetsController?.setSystemBarsAppearance(if (lightBackground) mask else 0, mask)
+    } else {
+        @Suppress("DEPRECATION")
+        var vis = window.decorView.systemUiVisibility
+        vis = if (lightBackground) {
+            vis or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        } else {
+            vis and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv() and View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR.inv()
+        }
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = vis
+    }
+}
+
+@Composable internal fun PlayerSheetSystemBarsEffect(lightBackground: Boolean) {
+    val view = LocalView.current
+    val darkTheme = isSystemInDarkTheme()
+    DisposableEffect(view, lightBackground, darkTheme) {
+        var ctx: android.content.Context? = view.context
+        var activity: android.app.Activity? = null
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is android.app.Activity) { activity = ctx; break }
+            ctx = ctx.baseContext
+        }
+        val window = activity?.window
+        window?.let { applyGradientBarIcons(it, lightBackground) }
+        onDispose {
+            // 恢复深浅主题默认：浅色主题深图标、深色主题浅图标，与 enableEdgeToEdge(auto) 一致
+            window?.let { applyGradientBarIcons(it, !darkTheme) }
+        }
     }
 }
 
@@ -274,37 +344,52 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
             onClose()
         }
     }
-    Dialog(
-        onDismissRequest = { dismissAnimated() },
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = true)
+    // 全屏覆盖层：画在已 edge-to-edge 的 Activity 窗口内，渐变可延伸到状态栏/导航栏下；
+    // 独立 Dialog 窗口不受 Activity 沉浸设置控制，内容无法真正全屏，故不用 Dialog。
+    BackHandler { dismissAnimated() }
+    Box(
+        Modifier.fillMaxSize()
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {}
+            )
     ) {
-        val dialogView = LocalView.current
-        SideEffect {
-            (dialogView.parent as? DialogWindowProvider)?.window?.setDimAmount(0f)
+        val (gradientStart, gradientEnd) = rememberCoverGradientColors(now?.item?.artwork)
+        val gradientLight = (gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.65f
+        PlayerSheetSystemBarsEffect(gradientLight)
+        // 打开首帧快照一次栏高并永久冻结（写一次后永不更新），全屏显隐改变全局 insets 也不跟随
+        val density = LocalDensity.current
+        var frozenStatusTop by remember { mutableStateOf<Dp?>(null) }
+        var frozenNavBottom by remember { mutableStateOf<Dp?>(null) }
+        if (frozenStatusTop == null || frozenNavBottom == null) {
+            with(density) {
+                if (frozenStatusTop == null) frozenStatusTop = WindowInsets.statusBars.getTop(density).toDp()
+                if (frozenNavBottom == null) frozenNavBottom = WindowInsets.navigationBars.getBottom(density).toDp()
+            }
         }
         AnimatedVisibility(
             visibleState = transition,
-            enter = slideInVertically(initialOffsetY = { it }, animationSpec = tween(550)),
+            enter = slideInVertically(initialOffsetY = { it }, animationSpec = tween(300)),
             exit = slideOutVertically(
                 targetOffsetY = { it },
-                animationSpec = tween(durationMillis = 550, easing = CubicBezierEasing(0.8f, 0f, 0.6f, 1f))
+                animationSpec = tween(durationMillis = 300, easing = CubicBezierEasing(0.8f, 0f, 0.6f, 1f))
             )
         ) {
-            val (gradientStart, gradientEnd) = rememberCoverGradientColors(now?.item?.artwork)
             val gradientBrush = remember(gradientStart, gradientEnd) {
                 Brush.linearGradient(colors = listOf(gradientStart, gradientEnd), start = Offset.Zero, end = Offset.Infinite)
             }
             val gradientContentTarget =
-                if ((gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.5f) Color.Black else Color.White
+                if ((gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.65f) Color.Black else Color.White
             val gradientSubTarget = gradientContentTarget.copy(alpha = 0.7f)
             val gradientContent by animateColorAsState(targetValue = gradientContentTarget, animationSpec = tween(600), label = "coverGradientContent")
             val gradientSubContent by animateColorAsState(targetValue = gradientSubTarget, animationSpec = tween(600), label = "coverGradientSubContent")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(gradientBrush)) {
-                Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp)) {
+                Column(Modifier.fillMaxSize().padding(top = frozenStatusTop ?: 0.dp, bottom = frozenNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { dismissAnimated() }) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = gradientContent) }
-                        Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f), fontWeight = FontWeight.Bold, color = gradientContent)
+                        IconButton(onClick = { dismissAnimated() }, modifier = Modifier.offset(x = (-8).dp)) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = gradientContent) }
+                        Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f).offset(x = (-8).dp), fontWeight = FontWeight.Bold, color = gradientContent)
                         IconButton(onClick = onOpenDownload, enabled = now != null) { Icon(Icons.Default.Download, "下载", tint = gradientContent) }
                         IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, if (showQueue) "返回播放页" else "播放列表", tint = gradientContent) }
                     }
@@ -334,11 +419,12 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
             } else {
                 val item = now?.item
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(28.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
+                    Spacer(Modifier.height(12.dp))
+                    Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(16.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
                         if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(112.dp), tint = Color.White)
                         else AsyncImage(model = item?.artwork, contentDescription = item?.title, modifier = Modifier.fillMaxSize())
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(24.dp))
                     Row(verticalAlignment = Alignment.Bottom) {
                         Column(Modifier.weight(1f)) {
                             Text(item?.title ?: "暂无播放", fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = gradientContent)
@@ -349,7 +435,7 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
                                 fontSize = 12.sp, color = gradientSubContent
                             )
                         }
-                        IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质", tint = gradientContent) }
+                        IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(x = 8.dp, y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质", tint = gradientContent) }
                     }
                     var seeking by remember(now?.key) { mutableStateOf(false) }
                     var seekFrac by remember(now?.key) { mutableStateOf(0f) }
@@ -366,6 +452,10 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
                         else -> positionMs
                     }
                     val shownFrac = if (durationMs > 0) (shownPosMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+                    val sliderFrac = if (seeking) seekFrac else shownFrac
+                    val progressActive = if (durationMs > 0) gradientContent.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    val progressInactive = if (durationMs > 0) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    val dotColor = if (durationMs > 0) gradientContent else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                     Slider(
                         value = if (seeking) seekFrac else shownFrac,
                         onValueChange = { seeking = true; seekFrac = it },
@@ -378,10 +468,34 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
                             }
                         },
                         enabled = durationMs > 0,
-                        track = { sliderState ->
-                        SliderDefaults.Track(sliderState = sliderState)
+                        track = {
+                        // 已播与未播分段绘制、互不重叠：半透明层叠加会二次混合，
+                        // 在已播段边缘形成一圈深色描边状接缝
+                        BoxWithConstraints(Modifier.fillMaxWidth().height(16.dp)) {
+                            val lineWidth = maxWidth
+                            val frac = sliderFrac.coerceIn(0f, 1f)
+                            Row(
+                                Modifier.align(Alignment.CenterStart).fillMaxWidth().height(16.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    Modifier.width(lineWidth * frac).height(5.dp)
+                                        .clip(androidx.compose.foundation.shape.CircleShape).background(progressActive)
+                                )
+                                Box(
+                                    Modifier.weight(1f).height(3.dp)
+                                        .clip(androidx.compose.foundation.shape.CircleShape).background(progressInactive)
+                                )
+                            }
+                            val dotSize = 10.dp
+                            val dotOffset = (lineWidth * frac - dotSize / 2).coerceIn(0.dp, lineWidth - dotSize)
+                            Box(
+                                Modifier.align(Alignment.CenterStart).padding(start = dotOffset).size(dotSize)
+                                    .clip(androidx.compose.foundation.shape.CircleShape).background(dotColor)
+                            )
+                        }
                     },
-                        thumb = { Box(Modifier.size(22.dp).clip(androidx.compose.foundation.shape.CircleShape).background(if (durationMs > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))) }
+                        thumb = { }
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(formatDuration(shownPosMs), fontSize = 12.sp, color = gradientSubContent)
@@ -390,15 +504,15 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
                     }
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = onToggleFavorite, enabled = now != null) { Icon(imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = "收藏", tint = gradientContent) }
-                        IconButton(onClick = onPrev, enabled = now != null) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = gradientContent) }
+                        IconButton(onClick = onPrev, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = gradientContent, modifier = Modifier.size(36.dp)) }
                         if ((now?.loading == true || buffering) && now != null) {
-                            Box(Modifier.size(64.dp).clip(RoundedCornerShape(32.dp)).background(MaterialTheme.colorScheme.primary), Alignment.Center) {
-                                CircularProgressIndicator(Modifier.size(30.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 3.dp)
+                            Box(Modifier.size(64.dp), Alignment.Center) {
+                                CircularProgressIndicator(Modifier.size(48.dp), color = gradientContent, strokeWidth = 3.dp)
                             }
                         } else {
-                            FilledIconButton(onClick = onToggle, modifier = Modifier.size(64.dp), enabled = now != null) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放") }
+                            IconButton(onClick = onToggle, modifier = Modifier.size(64.dp), enabled = now != null) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放", tint = gradientContent, modifier = Modifier.size(54.dp)) }
                         }
-                        IconButton(onClick = onNext, enabled = now != null) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = gradientContent) }
+                        IconButton(onClick = onNext, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = gradientContent, modifier = Modifier.size(36.dp)) }
                         IconButton(onClick = onOpenAddPlaylist, enabled = now != null) { Icon(imageVector = Icons.Default.PlaylistAdd, contentDescription = "加歌单", tint = gradientContent) }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
@@ -489,7 +603,7 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(top = padTop, bottom = padBottom)) {
             itemsIndexed(lines) { index, line ->
                 val active = index == currentIndex
-                Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Medium, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
             }
         }
     }
