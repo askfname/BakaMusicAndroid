@@ -37,12 +37,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -81,7 +85,7 @@ import android.view.WindowInsetsController
         }.getOrNull()
     }
     val containerColor = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
-    val contentColor = if (containerColor.luminance() > 0.65f) Color.Black else Color.White
+    val contentColor = if (containerColor.luminance() > 0.6f) Color.Black else Color.White
     val subContentColor = contentColor.copy(alpha = 0.7f)
     val buttonTint = if (enabled) contentColor else contentColor.copy(alpha = 0.38f)
     val progress = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
@@ -356,7 +360,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             )
     ) {
         val (gradientStart, gradientEnd) = rememberCoverGradientColors(now?.item?.artwork)
-        val gradientLight = (gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.65f
+        val gradientLight = (gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.6f
         PlayerSheetSystemBarsEffect(gradientLight)
         // 打开首帧快照一次栏高并永久冻结（写一次后永不更新），全屏显隐改变全局 insets 也不跟随
         val density = LocalDensity.current
@@ -380,7 +384,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                 Brush.linearGradient(colors = listOf(gradientStart, gradientEnd), start = Offset.Zero, end = Offset.Infinite)
             }
             val gradientContentTarget =
-                if ((gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.65f) Color.Black else Color.White
+                if ((gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.6f) Color.Black else Color.White
             val gradientSubTarget = gradientContentTarget.copy(alpha = 0.7f)
             val gradientContent by animateColorAsState(targetValue = gradientContentTarget, animationSpec = tween(600), label = "coverGradientContent")
             val gradientSubContent by animateColorAsState(targetValue = gradientSubTarget, animationSpec = tween(600), label = "coverGradientSubContent")
@@ -454,7 +458,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                     val shownFrac = if (durationMs > 0) (shownPosMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
                     val sliderFrac = if (seeking) seekFrac else shownFrac
                     val progressActive = if (durationMs > 0) gradientContent.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                    val progressInactive = if (durationMs > 0) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    val progressInactive = if (durationMs > 0) gradientContent.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
                     val dotColor = if (durationMs > 0) gradientContent else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                     Slider(
                         value = if (seeking) seekFrac else shownFrac,
@@ -520,7 +524,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                         IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp), tint = gradientContent) }
                     }
                     Box(Modifier.fillMaxWidth().height(220.dp)) {
-                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, centered = true, activeColor = gradientContent, inactiveColor = gradientSubContent)
+                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, playing = playing, centered = true, activeColor = gradientContent, inactiveColor = gradientSubContent, onSeek = onSeek, showLoadingSpinner = false)
                     }
                 }
             }
@@ -535,18 +539,29 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
     lines: List<LyricLine>,
     positionMs: Long,
     loading: Boolean,
+    playing: Boolean = true,
     markerFraction: Float = 0.24f,
     fontScale: Float = 1f,
     centered: Boolean = false,
     activeColor: Color = MaterialTheme.colorScheme.primary,
-    inactiveColor: Color = MaterialTheme.colorScheme.onSurfaceVariant
+    inactiveColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    onSeek: ((Long) -> Unit)? = null,
+    showLoadingSpinner: Boolean = true
 ) {
     if (loading) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = activeColor); Spacer(Modifier.width(8.dp)); Text("歌词加载中", color = inactiveColor) } }
+        if (showLoadingSpinner) {
+            Box(Modifier.fillMaxSize(), Alignment.Center) { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = activeColor); Spacer(Modifier.width(8.dp)); Text("歌词加载中", color = inactiveColor) } }
+        } else {
+            Box(Modifier.fillMaxSize().padding(top = 56.dp), Alignment.TopCenter) { Text("歌词加载中", color = inactiveColor) }
+        }
         return
     }
     if (lines.isEmpty()) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Text("暂无歌词", color = inactiveColor) }
+        if (showLoadingSpinner) {
+            Box(Modifier.fillMaxSize(), Alignment.Center) { Text("暂无歌词", color = inactiveColor) }
+        } else {
+            Box(Modifier.fillMaxSize().padding(top = 56.dp), Alignment.TopCenter) { Text("暂无歌词", color = inactiveColor) }
+        }
         return
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -555,7 +570,28 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         val lyricScope = rememberCoroutineScope()
         var follow by remember(lines) { mutableStateOf(true) }
         var resumeFollowJob by remember { mutableStateOf<Job?>(null) }
-        val currentIndex = remember(lines, positionMs) { lines.indexOfLast { it.timeMs <= positionMs }.coerceAtLeast(0) }
+        // 同步修复：ViewModel 轮询约 50ms 快照仍有量化台阶，播放中按帧外推，
+        // currentIndex 切换不再晚一拍；暂停/切歌时以外推基准对齐避免跳变
+        var basePosMs by remember(lines) { mutableStateOf(positionMs) }
+        var baseUptime by remember(lines) { mutableStateOf(android.os.SystemClock.uptimeMillis()) }
+        var displayPosMs by remember(lines) { mutableStateOf(positionMs) }
+        LaunchedEffect(positionMs, lines) {
+            basePosMs = positionMs
+            baseUptime = android.os.SystemClock.uptimeMillis()
+            if (!playing) displayPosMs = positionMs
+        }
+        LaunchedEffect(playing, lines) {
+            if (!playing) {
+                displayPosMs = basePosMs
+                return@LaunchedEffect
+            }
+            while (true) {
+                withFrameNanos {
+                    displayPosMs = basePosMs + (android.os.SystemClock.uptimeMillis() - baseUptime)
+                }
+            }
+        }
+        val currentIndex = remember(lines, displayPosMs) { lines.indexOfLast { it.timeMs <= displayPosMs }.coerceAtLeast(0) }
         suspend fun scrollCurrentToAnchor(index: Int, animated: Boolean) {
             val i = index.coerceIn(lines.indices)
             val anchorPx = with(density) { (maxHeight * markerFraction).toPx() }
@@ -603,7 +639,32 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(top = padTop, bottom = padBottom)) {
             itemsIndexed(lines) { index, line ->
                 val active = index == currentIndex
-                Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Medium, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                // 点按跳转：整行可点击，seek 到该行起始时间（拖拽滚动不受影响）
+                val seekModifier = if (onSeek != null) {
+                    Modifier.clickable(
+                        interactionSource = remember(line.timeMs) { MutableInteractionSource() },
+                        indication = null
+                    ) { onSeek(line.timeMs) }
+                } else Modifier
+                if (active && line.words.isNotEmpty()) {
+                    // 逐字卡拉 OK：已唱亮起、当前字按进度混合、未唱置灰
+                    val karaoke = remember(line, displayPosMs, activeColor, inactiveColor) {
+                        buildAnnotatedString {
+                            line.words.forEach { w ->
+                                val frac = ((displayPosMs - w.startMs).toFloat() / (w.endMs - w.startMs).coerceAtLeast(1)).coerceIn(0f, 1f)
+                                val c = when {
+                                    frac >= 1f -> activeColor
+                                    frac <= 0f -> inactiveColor
+                                    else -> lerp(inactiveColor, activeColor, frac)
+                                }
+                                withStyle(SpanStyle(color = c)) { append(w.text) }
+                            }
+                        }
+                    }
+                    Text(karaoke, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = 5.dp), fontSize = 17.sp * fontScale, fontWeight = FontWeight.Bold, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                } else {
+                    Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Medium, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                }
             }
         }
     }

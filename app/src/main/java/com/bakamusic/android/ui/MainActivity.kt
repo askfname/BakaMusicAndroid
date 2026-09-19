@@ -271,7 +271,7 @@ private fun showSystemBars(window: Window) {
         BackHandler { dismissLyricAnimated() }
         // 与音乐播放器界面一样的封面取色对角线渐变背景（含切换时的平滑过渡）
         val (lyricGradientStart, lyricGradientEnd) = rememberCoverGradientColors(viewModel.nowPlaying?.item?.artwork)
-        val lyricLight = (lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.65f
+        val lyricLight = (lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.6f
         val lyricOverlayView = LocalView.current
         val lyricDarkTheme = isSystemInDarkTheme()
         DisposableEffect(lyricOverlayView, lyricLight, lyricDarkTheme) {
@@ -317,13 +317,13 @@ private fun showSystemBars(window: Window) {
                 )
             }
             val lyricContentTarget =
-                if ((lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.65f) Color.Black else Color.White
+                if ((lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.6f) Color.Black else Color.White
             val lyricSubTarget = lyricContentTarget.copy(alpha = 0.7f)
             val lyricContent by animateColorAsState(targetValue = lyricContentTarget, animationSpec = tween(600), label = "lyricContent")
             val lyricSubContent by animateColorAsState(targetValue = lyricSubTarget, animationSpec = tween(600), label = "lyricSubContent")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(lyricGradientBrush)) {
-                Column(Modifier.fillMaxSize().padding(bottom = frozenLyricNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 24.dp)) {
+                Column(Modifier.fillMaxSize().padding(bottom = frozenLyricNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 32.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("歌词", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = lyricContent)
@@ -341,11 +341,13 @@ private fun showSystemBars(window: Window) {
                             lines = viewModel.lyricLines,
                             positionMs = viewModel.positionMs,
                             loading = viewModel.lyricLoading && viewModel.nowPlaying != null,
+                            playing = viewModel.playing,
                             markerFraction = 0.24f,
                             fontScale = 1.35f,
                             centered = true,
                             activeColor = lyricContent,
-                            inactiveColor = lyricSubContent
+                            inactiveColor = lyricSubContent,
+                            onSeek = { viewModel.seekTo(it) }
                         )
                     }
                 }

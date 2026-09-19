@@ -551,7 +551,7 @@ function getTopListDetail(topListItem) {"""
                 old.keys().forEach { key -> if (!mergedRaw.has(key)) mergedRaw.put(key, old.opt(key)) }
             }
             normalizeIdFields(mergedRaw)
-            mergedRaw.put("id", item.id)
+            putPluginId(mergedRaw, normalizePluginId(item.id).ifBlank { item.id })
             return item.copy(
                 artwork = enriched.artwork ?: item.artwork,
                 durationMs = enriched.durationMs.takeIf { it > 0 } ?: item.durationMs,
@@ -807,6 +807,18 @@ function getTopListDetail(topListItem) {"""
             }
         }
 
+        /**
+         * 回传 id 恢复数字类型：插件原始 JSON 中的数字 id 经桥接全变字符串，
+         * 而 QQ 等接口对 songID 做严格类型校验（字符串直接报 10006），
+         * 导致新歌词接口失败并降级到无逐字的旧接口。桌面端传递原生数字类型，
+         * 此处对纯整数 id 同样放回数字（其余保持字符串，避免前导零等变形）。
+         */
+        private fun putPluginId(obj: JSONObject, id: String) {
+            val num = id.toLongOrNull()
+            if (num != null && num >= 0 && (id == "0" || !id.startsWith("0"))) obj.put("id", num)
+            else obj.put("id", id)
+        }
+
         /** 新音质→旧插件兼容音质键（与桌面端 newToLegacyQualityMap 一致），旧插件无此概念时返回 null。 */
         private fun legacyQualityOf(key: String): String? = when (key) {
             "96k", "128k" -> "low"
@@ -819,14 +831,14 @@ function getTopListDetail(topListItem) {"""
         /** 榜单条目回传插件：保留原始字段供插件定位榜单 */
         private fun topListJson(item: TopListItem) = runCatching { if (item.rawJson != null) JSONObject(item.rawJson) else JSONObject() }.getOrDefault(JSONObject()).apply {
             normalizeIdFields(this)
-            put("id", normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform.ifBlank { platformName }); put("title", item.title)
+            putPluginId(this, normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform.ifBlank { platformName }); put("title", item.title)
             if (!has("coverImg") && item.coverImg != null) put("coverImg", item.coverImg)
             if (!has("description") && item.description.isNotBlank()) put("description", item.description)
         }
 
         private fun itemJson(item: MediaItem) = runCatching { if (item.rawJson != null) JSONObject(item.rawJson) else JSONObject() }.getOrDefault(JSONObject()).apply {
             normalizeIdFields(this)
-            put("id", normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform); put("title", item.title); put("artist", item.artist); put("album", item.album)
+            putPluginId(this, normalizePluginId(item.id).ifBlank { item.id }); put("platform", item.platform); put("title", item.title); put("artist", item.artist); put("album", item.album)
             // 补充秒级单位的 duration 字段，确保 rawJson 缺失时插件仍可获取时长
             if (!has("duration") && item.durationMs > 0) put("duration", item.durationMs / 1000)
             if (!has("durationMs") && item.durationMs > 0) put("durationMs", item.durationMs)

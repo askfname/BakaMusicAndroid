@@ -108,11 +108,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
         }
 
-        // 轮询播放状态
+        // 轮询播放状态：歌词行切换依赖 positionMs，200ms 会带来最高 200ms+滚动动画的观感延迟，
+        // 改为 50ms 快照 + LyricsView 帧级外推，行切换与音乐对齐；会话落盘周期保持 5s 不变
         viewModelScope.launch {
             var pollTick = 0
             while (true) {
-                delay(200)
+                delay(50)
                 val s = runCatching { playbackController.snapshot() }.getOrNull() ?: continue
                 playing = s.isPlaying
                 if (s.itemCount > 0) positionMs = s.positionMs
@@ -120,7 +121,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 serviceItemCount = s.itemCount
                 if (s.durationMs > 0) durationMs = s.durationMs
                 
-                if (nowPlaying != null && ++pollTick % 25 == 0) {
+                if (nowPlaying != null && ++pollTick % 100 == 0) {
                     sessionStore.savePosition(positionMs)
                 }
 
