@@ -64,6 +64,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var playToken = 0
     private var playRequestJob: Job? = null
 
+    /**
+     * 切音质位置保持：新流起播后位置先归零、seek 后才回到原位，
+     * 此期间轮询若直接跟随，进度条与歌词会先跳到开头再跳回。
+     * 置位后轮询不再跟随快照，直到位置收敛到保持点附近或超时。
+     */
+    private var holdPositionMs: Long? = null
+    private var holdSinceMs: Long = 0L
+
     init {
         // 恢复播放会话
         sessionStore.load()?.let { saved ->
@@ -116,7 +124,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 delay(50)
                 val s = runCatching { playbackController.snapshot() }.getOrNull() ?: continue
                 playing = s.isPlaying
-                if (s.itemCount > 0) positionMs = s.positionMs
+                val hold = holdPositionMs
+                if (hold != null && s.itemCount > 0) {
+                    // 切音质保持中：收敛到保持点附近或超时才解除，其余时间不跟随新流的归零位置
+                    if (kotlin.math.abs(s.positionMs - hold) < 1500 || System.currentTimeMillis() - holdSinceMs > 10000) {
+                        holdPositionMs = null
+                        positionMs = s.positionMs
+                    }
+                } else if (s.itemCount > 0) {
+                    positionMs = s.positionMs
+                }
                 buffering = s.buffering
                 serviceItemCount = s.itemCount
                 if (s.durationMs > 0) durationMs = s.durationMs
@@ -187,6 +204,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         playRequestJob?.cancel()
         sourceService.cancelPendingRequests()
         playing = false
+        holdPositionMs = null
         positionMs = 0
         durationMs = item.durationMs
         queueIndex = index
@@ -391,9 +409,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 resolvedCache[itemKey] = np
             }
             nowPlaying = np
+            // 起播新流前先保持住当前位置，避免轮询跟随归零导致进度条与歌词来回跳
+            holdPositionMs = keepPos
+            holdSinceMs = System.currentTimeMillis()
+            positionMs = keepPos
             runCatching {
                 playbackController.play(np.item.copy(mediaUrl = url, mediaHeaders = res.mediaHeaders))
             }.onFailure {
+                holdPositionMs = null
                 playError = "播放失败：${it.message}"
                 if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)
                 return@launch
@@ -412,6 +435,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
     
     fun seekTo(pos: Long) {
+        // 用户手动接管进度：解除切音质的位置保持，跟随用户目标
+        holdPositionMs = null
         playbackController.seekTo(pos)
     }
 }

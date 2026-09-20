@@ -388,6 +388,9 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             val gradientSubTarget = gradientContentTarget.copy(alpha = 0.7f)
             val gradientContent by animateColorAsState(targetValue = gradientContentTarget, animationSpec = tween(600), label = "coverGradientContent")
             val gradientSubContent by animateColorAsState(targetValue = gradientSubTarget, animationSpec = tween(600), label = "coverGradientSubContent")
+            // 未播放歌词（含逐字未播放部分）更浅：与副标题 0.7 区分，突出当前行
+            val lyricInactiveTarget = gradientContentTarget.copy(alpha = 0.45f)
+            val lyricInactive by animateColorAsState(targetValue = lyricInactiveTarget, animationSpec = tween(600), label = "coverLyricInactive")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(gradientBrush)) {
                 Column(Modifier.fillMaxSize().padding(top = frozenStatusTop ?: 0.dp, bottom = frozenNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 8.dp)) {
@@ -524,7 +527,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                         IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp), tint = gradientContent) }
                     }
                     Box(Modifier.fillMaxWidth().height(220.dp)) {
-                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, playing = playing, centered = true, activeColor = gradientContent, inactiveColor = gradientSubContent, onSeek = onSeek, showLoadingSpinner = false)
+                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, playing = playing, centered = true, activeColor = gradientContent, inactiveColor = lyricInactive, onSeek = onSeek, showLoadingSpinner = false)
                     }
                 }
             }
@@ -546,7 +549,8 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
     activeColor: Color = MaterialTheme.colorScheme.primary,
     inactiveColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     onSeek: ((Long) -> Unit)? = null,
-    showLoadingSpinner: Boolean = true
+    showLoadingSpinner: Boolean = true,
+    lineGap: Dp = 5.dp
 ) {
     if (loading) {
         if (showLoadingSpinner) {
@@ -661,9 +665,10 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                             }
                         }
                     }
-                    Text(karaoke, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = 5.dp), fontSize = 17.sp * fontScale, fontWeight = FontWeight.Bold, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                    Text(karaoke, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = lineGap), fontSize = 17.sp * fontScale, fontWeight = FontWeight.Bold, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
                 } else {
-                    Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = 5.dp), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.Medium, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
+                    // 未播放行用半粗：比之前的中粗更结实，但仍低于播放行的粗体
+                    Text(line.text.ifBlank { " " }, modifier = Modifier.fillMaxWidth().then(seekModifier).padding(vertical = lineGap), fontSize = (if (active) 17 else 14).sp * fontScale, fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold, color = if (active) activeColor else inactiveColor, textAlign = if (centered) TextAlign.Center else TextAlign.Start)
                 }
             }
         }

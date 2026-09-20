@@ -4,13 +4,7 @@ import java.io.ByteArrayOutputStream
 import java.util.zip.Inflater
 
 /**
- * 歌词解密：Kotlin 移植自桌面端 shared/plugin-manager/main/lyric-decrypt.ts
- * （其又转自 MusicFree mobile 的 customDES.ts + musicDecrypter.ts）。
- *
- * 背景：QQ 新接口（GetPlayLyricInfo，qrc=1/crypt=1）返回的 rawLrc 可能是
- * QRC 加密十六进制串或 QRC XML；桌面端在解析前统一经 autoDecryptLyric 还原为
- * 富 QRC（[行首ms,行时值]文字(字首ms,字时值)…），安卓端此前缺失该层，
- * 导致 QQ 等来源的逐字歌词无法展示逐字效果。此处补齐，保持行为与桌面端一致。
+ * 歌词解密：QRC 加密十六进制串或 QRC XML
  */
 object LyricDecrypt {
 

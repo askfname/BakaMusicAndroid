@@ -321,6 +321,9 @@ private fun showSystemBars(window: Window) {
             val lyricSubTarget = lyricContentTarget.copy(alpha = 0.7f)
             val lyricContent by animateColorAsState(targetValue = lyricContentTarget, animationSpec = tween(600), label = "lyricContent")
             val lyricSubContent by animateColorAsState(targetValue = lyricSubTarget, animationSpec = tween(600), label = "lyricSubContent")
+            // 全屏未播放歌词（含逐字未播放部分）更浅，与副标题 0.7 区分
+            val lyricInactiveTarget = lyricContentTarget.copy(alpha = 0.45f)
+            val lyricInactive by animateColorAsState(targetValue = lyricInactiveTarget, animationSpec = tween(600), label = "lyricInactive")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(lyricGradientBrush)) {
                 Column(Modifier.fillMaxSize().padding(bottom = frozenLyricNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 32.dp)) {
@@ -346,8 +349,9 @@ private fun showSystemBars(window: Window) {
                             fontScale = 1.35f,
                             centered = true,
                             activeColor = lyricContent,
-                            inactiveColor = lyricSubContent,
-                            onSeek = { viewModel.seekTo(it) }
+                            inactiveColor = lyricInactive,
+                            onSeek = { viewModel.seekTo(it) },
+                            lineGap = 10.dp
                         )
                     }
                 }
