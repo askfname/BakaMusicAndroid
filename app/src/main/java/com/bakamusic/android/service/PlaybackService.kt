@@ -36,7 +36,7 @@ object BakaMediaHeaders {
 
     /**
      * 播放器可能规范化 URI（如重定向/百分号编码差异）导致精确匹配失败，
-     * 此时按去 query/fragment 的基地址回退查找。bilibili 等直链强依赖
+     * 此时按去 query/fragment 的基地址回退查找
      * Referer，查不到头会直接 403。
      */
     fun getForRequest(url: String): Map<String, String> {
@@ -52,11 +52,7 @@ object BakaMediaHeaders {
 }
 
 /**
- * 自有播放数据源：按插件返回的请求头原样发送（UA/Referer/Cookie/Accept-Encoding）。
- * 背景：反编译确认 DefaultHttpDataSource.openConnection 会先应用自定义头，
- * 随后用工厂默认 UA 覆盖插件 UA、并按 allowGzip 覆盖 Accept-Encoding，
- * 导致 bilibili 等带签名的直链（与请求时的 UA 绑定）新鲜解析也 403，而桌面端
- * libmpv 原样发送插件头可以播放。此处同时手动跟随重定向并每次重发全部头。
+ * 自有播放数据源：按插件返回的请求头原样发送（UA/Referer/Cookie/Accept-Encoding）
  */
 @UnstableApi
 private class BakaPluginDataSource : BaseDataSource(true), HttpDataSource {
@@ -184,7 +180,7 @@ private class BakaPluginDataSource : BaseDataSource(true), HttpDataSource {
                     e, dataSpec, HttpDataSource.HttpDataSourceException.TYPE_OPEN
                 )
             }
-            // 仅当插件明确要求 gzip 才解压（我方默认 identity，不会走到这里）
+            // 仅当插件明确要求 gzip 才解压（默认 identity）
             val encoding = conn.getHeaderField("Content-Encoding").orEmpty()
             input = if (encoding.contains("gzip", true)) java.util.zip.GZIPInputStream(rawInput) else rawInput
             connection = conn

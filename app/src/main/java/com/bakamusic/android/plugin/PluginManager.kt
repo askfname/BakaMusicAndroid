@@ -15,6 +15,25 @@ data class PluginManifest(val url: String, val name: String? = null, val version
 data class InstalledPlugin(val id: String, val name: String, val version: String, val sourceUrl: String, val fileName: String, val enabled: Boolean, val order: Int)
 data class PluginSubscription(val id: String, val name: String, val url: String, val lastUpdated: Long = 0)
 
+/** 批量安装结果：成功数与因版本冲突跳过的清单名 */
+data class BatchInstallResult(val installed: Int, val skipped: List<String> = emptyList()) {
+    /** 成功提示后的跳过说明，无跳过时为空 */
+    fun skippedNotice(): String =
+        if (skipped.isEmpty()) "" else "；已安装更新的 ${skipped.joinToString("、")}，请卸载后重试"
+}
+
+/** 同名已安装更新版本时的冲突，批量安装中可跳过 */
+class PluginVersionConflictException(
+    message: String,
+    val pluginName: String = "",
+    val installedVersion: String = ""
+) : IllegalStateException(message) {
+    /** 名单标签 */
+    fun label(): String =
+        if (pluginName.isNotBlank() && installedVersion.isNotBlank()) "$pluginName（$installedVersion）"
+        else pluginName.ifBlank { super.message ?: "版本冲突" }
+}
+
 /** 插件本地注册表，JS 执行由沙箱运行时提供。 */
 class PluginManager(private val context: Context) {
     val applicationContext: Context get() = context.applicationContext
@@ -44,21 +63,24 @@ class PluginManager(private val context: Context) {
         item
     }
 
-    suspend fun updateSubscription(subscription: PluginSubscription): Result<Int> = runCatching {
-        val count = installFromUrl(subscription.url)
+    suspend fun updateSubscription(subscription: PluginSubscription): Result<BatchInstallResult> = runCatching {
+        val result = installFromUrl(subscription.url)
         saveSubscriptions(readSubscriptions().map { if (it.id == subscription.id) it.copy(lastUpdated = System.currentTimeMillis()) else it })
-        count
+        result
     }
 
-    suspend fun updateAllSubscriptions(): Result<Int> = runCatching {
+    suspend fun updateAllSubscriptions(): Result<BatchInstallResult> = runCatching {
         var total = 0
+        val skipped = mutableListOf<String>()
         readSubscriptions().forEach { subscription ->
-            total += updateSubscription(subscription).getOrThrow()
+            val result = updateSubscription(subscription).getOrThrow()
+            total += result.installed
+            skipped.addAll(result.skipped)
         }
-        total
+        BatchInstallResult(total, skipped.distinct())
     }
 
-    suspend fun installNetwork(url: String): Result<Int> = runCatching { installFromUrl(url.trim()) }
+    suspend fun installNetwork(url: String): Result<BatchInstallResult> = runCatching { installFromUrl(url.trim()) }
 
     suspend fun installLocal(file: File): Result<InstalledPlugin> = withContext(Dispatchers.IO) {
         runCatching {
@@ -66,43 +88,37 @@ class PluginManager(private val context: Context) {
             val ext = file.extension.lowercase()
             require(ext == "js" || ext == "json") { "本地插件仅支持 .js / .json 文件" }
             if (ext == "json") {
-                // 本地清单：逐条远程安装
+                // 本地清单：名取清单 name
                 val text = file.readText(Charsets.UTF_8)
                 require(text.toByteArray().size <= MAX_PLUGIN_BYTES) { "插件超过 5 MiB 限制" }
                 val sources = readManifestEntries(text, null)
                 require(sources.isNotEmpty()) { "清单中没有可用插件" }
                 var last: InstalledPlugin? = null
-                // 批量默认倒序安装：先安装的排序靠后
+                var count = 0
+                val skipped = mutableListOf<String>()
+                // 倒序安装，版本冲突单条跳过
                 for (src in sources.asReversed()) {
-                    val bytes = request(src.url)
-                    verifyHash(bytes, src.sha256, src.url)
-                    last = register(PluginManifest(src.url, null, null, src.sha256), bytes)
+                    try {
+                        val bytes = request(src.url)
+                        verifyHash(bytes, src.sha256, src.url)
+                        last = register(PluginManifest(src.url, src.name, src.version, src.sha256), bytes)
+                        count++
+                    } catch (e: PluginVersionConflictException) {
+                        skipped.add(e.label())
+                    }
+                }
+                if (count == 0 && skipped.isNotEmpty()) {
+                    throw PluginVersionConflictException("已安装更新的 ${skipped.distinct().joinToString("、")}，请卸载后重试")
                 }
                 last ?: throw IllegalStateException("清单安装失败")
             } else {
                 val bytes = file.readBytes()
                 require(bytes.size <= MAX_PLUGIN_BYTES) { "插件超过 5 MiB 限制" }
                 val text = bytes.toString(Charsets.UTF_8)
-                val platform = extractPlatform(text) ?: file.nameWithoutExtension
-                // 单个安装默认排序置于首位
-                register(PluginManifest("local://${file.name}", platform, extractVersion(text) ?: "本地文件"), bytes, placeFirst = true)
+                // 单个 js：以文件名命名
+                register(PluginManifest("local://${file.name}", file.nameWithoutExtension.ifBlank { file.name }, extractVersion(text) ?: "本地文件"), bytes, placeFirst = true)
             }
         }
-    }
-
-    /**
-     * 以 JS 运行时真实 platform 校正注册表名称。
-     * 返回更新后的条目，无需修正或存在同名冲突时返回 null。
-     */
-    fun healPluginName(id: String, runtimePlatform: String): InstalledPlugin? {
-        val want = normalizeName(runtimePlatform.trim()).takeIf { it.isNotEmpty() } ?: return null
-        val current = readPlugins()
-        val target = current.firstOrNull { it.id == id } ?: return null
-        if (target.name == want) return null
-        if (current.any { it.id != id && it.name == want }) return null
-        val updated = target.copy(name = want)
-        savePlugins(current.map { if (it.id == id) updated else it })
-        return updated
     }
 
     fun setEnabled(id: String, enabled: Boolean) { savePlugins(readPlugins().map { if (it.id == id) it.copy(enabled = enabled) else it }) }
@@ -125,7 +141,7 @@ class PluginManager(private val context: Context) {
         persistPlugins(full.mapIndexed { index, p -> p.copy(order = index) })
     }
 
-    private suspend fun installFromUrl(url: String): Int = withContext(Dispatchers.IO) {
+    private suspend fun installFromUrl(url: String): BatchInstallResult = withContext(Dispatchers.IO) {
         val clean = url.trim()
         require(isPluginUrl(clean)) { "插件地址必须是 HTTPS 的 .json 或 .js 地址" }
         val bytes = request(clean)
@@ -133,28 +149,38 @@ class PluginManager(private val context: Context) {
         if (text.startsWith("{")) {
             val base = runCatching { URI(clean).toString() }.getOrDefault(clean)
             val sources = readManifestEntries(text, base)
+            // 倒序安装；名取清单 name（缺失拒绝），版本冲突单条跳过
             var count = 0
-            // 批量默认倒序安装：先安装的排序靠后（订阅更新同样经由该流程）
+            val skipped = mutableListOf<String>()
             for (src in sources.asReversed()) {
-                val pluginBytes = request(src.url)
-                verifyHash(pluginBytes, src.sha256, src.url)
-                register(PluginManifest(src.url, null, null, src.sha256), pluginBytes)
-                count++
+                val entryName = src.name?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: throw IllegalArgumentException("不支持的链接：清单条目缺少插件名称")
+                try {
+                    val pluginBytes = request(src.url)
+                    verifyHash(pluginBytes, src.sha256, src.url)
+                    register(PluginManifest(src.url, entryName, src.version, src.sha256), pluginBytes)
+                    count++
+                } catch (e: PluginVersionConflictException) {
+                    skipped.add(e.label())
+                }
+            }
+            if (count == 0 && skipped.isNotEmpty()) {
+                throw PluginVersionConflictException("已安装更新的 ${skipped.distinct().joinToString("、")}，请卸载后重试")
             }
             require(count > 0) { "清单中没有可用插件" }
-            count
+            BatchInstallResult(count, skipped.distinct())
         } else {
             verifyHash(bytes, null, clean)
             val jsText = bytes.toString(Charsets.UTF_8)
+            // 单个 js：以 URL 文件名命名
             val fileName = runCatching { URI(clean).path.substringAfterLast('/').substringBeforeLast('.') }.getOrDefault("").ifBlank { "网络插件" }
-            val platform = extractPlatform(jsText) ?: fileName
             // 单个安装默认排序置于首位
-            register(PluginManifest(clean, platform, extractVersion(jsText)), bytes, placeFirst = true)
-            1
+            register(PluginManifest(clean, fileName, extractVersion(jsText)), bytes, placeFirst = true)
+            BatchInstallResult(1)
         }
     }
 
-    private data class RemoteSource(val url: String, val sha256: String?)
+    private data class RemoteSource(val url: String, val sha256: String?, val name: String? = null, val version: String? = null)
 
     private fun readManifestEntries(raw: String, baseUrl: String?): List<RemoteSource> {
         val root = JSONObject(raw)
@@ -170,7 +196,9 @@ class PluginManager(private val context: Context) {
             if (!pluginUrl.startsWith("https://", true)) continue
             val sha = parseExpectedSha256(item.optString("sha256").takeIf { it.isNotBlank() }
                 ?: item.optString("integrity").takeIf { it.isNotBlank() })
-            out.add(RemoteSource(pluginUrl, sha))
+            val entryName = item.optString("name").trim().takeIf { it.isNotEmpty() }
+            val entryVersion = item.optString("version").trim().takeIf { it.isNotEmpty() }
+            out.add(RemoteSource(pluginUrl, sha, entryName, entryVersion))
             if (out.size >= 100) break
         }
         return out
@@ -184,28 +212,28 @@ class PluginManager(private val context: Context) {
 
     private fun register(manifest: PluginManifest, bytes: ByteArray, placeFirst: Boolean = false): InstalledPlugin {
         require(bytes.size <= MAX_PLUGIN_BYTES) { "插件超过 5 MiB 限制" }
-        val jsText = runCatching { bytes.toString(Charsets.UTF_8) }.getOrDefault("")
-        val extractedPlatform = extractPlatform(jsText)
-        val extractedVersion = extractVersion(jsText)
-        val rawName = (manifest.name?.ifBlank { null } ?: extractedPlatform ?: "未命名插件")
-        val displayName = normalizeName(rawName)
+        // 安装名即展示名，缺失直接拒绝
+        val displayName = manifest.name?.trim()?.takeIf { it.isNotEmpty() }
+            ?: throw IllegalArgumentException("不支持的链接")
+        val extractedVersion = extractVersion(runCatching { bytes.toString(Charsets.UTF_8) }.getOrDefault(""))
         val version = (manifest.version?.ifBlank { null } ?: extractedVersion ?: "未知版本")
         val id = hash(manifest.url)
         val current = readPlugins()
         val oldSameUrl = current.firstOrNull { it.id == id }
-        // 同平台去重：新版本替换旧版本
+        // 同名去重：新版本替换旧版本
         val oldSamePlatform = current.firstOrNull { it.name == displayName && it.id != id }
         if (oldSamePlatform != null) {
-            // 拒绝旧版本覆盖已安装的新版本
-            if (compareVersion(oldSamePlatform.version, version) > 0) {
-                throw IllegalStateException("已安装更新的 ${displayName}（${oldSamePlatform.version}），拒绝旧版本覆盖")
+            // 未知版本跳过新旧比较
+            val comparable = oldSamePlatform.version != "未知版本" && version != "未知版本"
+            if (comparable && compareVersion(oldSamePlatform.version, version) > 0) {
+                throw PluginVersionConflictException("已安装更新的 ${displayName}（${oldSamePlatform.version}），请卸载后重试", displayName, oldSamePlatform.version)
             }
             File(root, oldSamePlatform.fileName).delete()
         }
         val plugin = InstalledPlugin(
             id, displayName, version, manifest.url, "$id.js",
             oldSameUrl?.enabled ?: oldSamePlatform?.enabled ?: true,
-            // 存量更新保持原位；单个新装排序置于首位，批量新装追加（调用方已倒序传入）
+            // 存量更新保持原位；单个新装排序置于首位，批量新装追加
             oldSameUrl?.order ?: oldSamePlatform?.order
                 ?: if (placeFirst) (current.minOfOrNull { it.order } ?: 0) - 1 else current.size
         )
@@ -265,7 +293,7 @@ class PluginManager(private val context: Context) {
     private fun saveSubscriptions(values: List<PluginSubscription>) { prefs.edit().putString("subscriptions", JSONArray(values.map(::subscriptionJson)).toString()).apply() }
     private fun <T> decode(raw: String?, parser: (JSONObject) -> T): List<T> = runCatching { val array = JSONArray(raw ?: "[]"); List(array.length()) { parser(array.getJSONObject(it)) } }.getOrDefault(emptyList())
     private fun pluginJson(item: InstalledPlugin) = JSONObject().apply { put("id", item.id); put("name", item.name); put("version", item.version); put("sourceUrl", item.sourceUrl); put("fileName", item.fileName); put("enabled", item.enabled); put("order", item.order) }
-    private fun pluginFromJson(item: JSONObject) = InstalledPlugin(item.getString("id"), normalizeName(item.optString("name", "未命名插件")), item.optString("version", "未知版本"), item.optString("sourceUrl"), item.getString("fileName"), item.optBoolean("enabled", true), item.optInt("order"))
+    private fun pluginFromJson(item: JSONObject) = InstalledPlugin(item.getString("id"), item.optString("name", "未命名插件").ifBlank { "未命名插件" }, item.optString("version", "未知版本"), item.optString("sourceUrl"), item.getString("fileName"), item.optBoolean("enabled", true), item.optInt("order"))
     private fun subscriptionJson(item: PluginSubscription) = JSONObject().apply { put("id", item.id); put("name", item.name); put("url", item.url); put("lastUpdated", item.lastUpdated) }
     private fun subscriptionFromJson(item: JSONObject) = PluginSubscription(item.getString("id"), item.getString("name"), item.getString("url"), item.optLong("lastUpdated"))
     private fun List<InstalledPlugin>.reorder() = sortedWith(compareBy<InstalledPlugin> { it.order }.thenBy { it.id }).mapIndexed { index, item -> item.copy(order = index) }
@@ -287,33 +315,8 @@ class PluginManager(private val context: Context) {
     companion object {
         private const val MAX_PLUGIN_BYTES = 5 * 1024 * 1024
         private const val MAX_RESPONSE_BYTES = 16L * 1024 * 1024
-        /** 已知音源名，用于从候选项中识别实际导出的 platform */
-        private val KNOWN_PLATFORM_NAMES = setOf(
-            "qq音乐", "网易云音乐", "酷我音乐", "酷狗音乐", "咪咕音乐", "汽水音乐",
-            "bilibili", "qq", "wy", "kw", "kg", "mg", "qishui"
-        )
-        /** 非插件名的 platform 取值（请求参数等） */
-        private val NON_PLATFORM_VALUES = setOf(
-            "web", "pc", "h5", "android", "ios", "windows", "mac", "webfilter", "yqq.json"
-        )
     }
 
-    private fun extractPlatform(js: String): String? {
-        // 键可带引号，同时排除 device_platform 等复合键
-        val strValues = Regex("""[^A-Za-z0-9_$]["']?platform["']?\s*:\s*(["'])([^"']{1,64})\1""")
-            .findAll(js).map { it.groupValues[2].trim() }
-            .filter { it.isNotEmpty() && it.length <= 128 }.toList()
-        // 优先取已知音源名，导出定义位于文件末尾故取最后一个，并跳过请求参数中的同名取值
-        strValues.lastOrNull { KNOWN_PLATFORM_NAMES.contains(it.lowercase()) || it.contains("音乐") }?.let { return it }
-        strValues.lastOrNull { !NON_PLATFORM_VALUES.contains(it.lowercase()) }?.let { return it }
-        // 兼容 platform: SOME_CONST 写法：追踪常量的字符串赋值
-        Regex("""[^A-Za-z0-9_$]["']?platform["']?\s*:\s*([A-Za-z_$][\w$]*)""")
-            .findAll(js).map { it.groupValues[1] }.toList().asReversed().forEach { name ->
-                Regex("""(?:const|let|var)\s+${Regex.escape(name)}\s*=\s*(["'])([^"']{1,64})\1""")
-                    .find(js)?.let { return it.groupValues[2].trim().takeIf { v -> v.isNotEmpty() } }
-            }
-        return strValues.lastOrNull()
-    }
     private fun extractVersion(js: String): String? {
         // 键可带引号，排除 version_code / appVersion 等复合键
         val values = Regex("""[^A-Za-z0-9_$]["']?version["']?\s*:\s*["']([^"']{1,32})["']""")
@@ -336,5 +339,4 @@ class PluginManager(private val context: Context) {
     }
     private fun hashBytes(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
     private fun hash(value: String) = hashBytes(value.toByteArray()).take(24)
-    private fun normalizeName(name: String): String = mapOf("qq" to "QQ音乐", "wy" to "网易云音乐", "kw" to "酷我音乐", "kg" to "酷狗音乐", "mg" to "咪咕音乐", "qishui" to "汽水音乐", "bilibili" to "bilibili")[name.lowercase()] ?: name
 }

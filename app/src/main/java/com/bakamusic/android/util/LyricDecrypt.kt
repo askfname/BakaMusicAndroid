@@ -284,7 +284,7 @@ object LyricDecrypt {
         return output
     }
 
-    /** QRC 解码：KEY1 解密 → KEY2 加密 → KEY3 解密（与桌面端 lyricDecode 一致）。 */
+    /** QRC 解码：KEY1 解密 → KEY2 加密 → KEY3 解密 */
     private fun lyricDecode(content: ByteArray): ByteArray {
         val length = content.size
         var result = funcDdes(content, KEY1, length)
@@ -339,7 +339,7 @@ object LyricDecrypt {
     private val kanaTag = Regex("\\[kana:.*?\\]")
 
     /**
-     * QRC XML → 保留逐字时间轴的富 QRC，与桌面端 convertQrcXmlToRichQrc 一致：
+     * QRC XML → 保留逐字时间轴的富 QRC
      * [行首ms,行时值]文字(字首ms,字时值)…
      */
     fun convertQrcXmlToRichQrc(xml: String): String {
@@ -373,8 +373,8 @@ object LyricDecrypt {
     }
 
     /**
-     * 与桌面端 autoDecryptLyric 一致：加密串解密、QRC XML 转富 QRC，
-     * 普通 LRC/纯文本原样返回；失败时返回原文（桌面端 catch 后返回原文）。
+     * 加密串解密、QRC XML 转富 QRC
+     * 普通 LRC/纯文本原样返回；失败时返回原文
      */
     fun autoDecryptLyric(lyrics: String?): String? {
         if (lyrics.isNullOrEmpty()) return lyrics

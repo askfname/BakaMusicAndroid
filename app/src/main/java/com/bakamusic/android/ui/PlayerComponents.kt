@@ -231,7 +231,7 @@ private var lastResolvedGradient: Pair<Color, Color>? = null
 @Composable fun rememberCoverGradientColors(artwork: String?): Pair<Color, Color> {
     val defaultStart = MaterialTheme.colorScheme.secondaryContainer
     val defaultEnd = MaterialTheme.colorScheme.surfaceContainerLow
-    // 同步读缓存作为初值：命中时首帧即取色结果，不会先提交一帧默认色；
+    // 同步读缓存作为初值：命中时首帧即取色结果；
     // 未命中则沿用上次解出的颜色，切歌时从旧色直接过渡到新色。
     var raw by remember(artwork) {
         mutableStateOf(
@@ -349,7 +349,6 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         }
     }
     // 全屏覆盖层：画在已 edge-to-edge 的 Activity 窗口内，渐变可延伸到状态栏/导航栏下；
-    // 独立 Dialog 窗口不受 Activity 沉浸设置控制，内容无法真正全屏，故不用 Dialog。
     BackHandler { dismissAnimated() }
     Box(
         Modifier.fillMaxSize()
@@ -362,7 +361,6 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         val (gradientStart, gradientEnd) = rememberCoverGradientColors(now?.item?.artwork)
         val gradientLight = (gradientStart.luminance() + gradientEnd.luminance()) / 2f > 0.6f
         PlayerSheetSystemBarsEffect(gradientLight)
-        // 打开首帧快照一次栏高并永久冻结（写一次后永不更新），全屏显隐改变全局 insets 也不跟随
         val density = LocalDensity.current
         var frozenStatusTop by remember { mutableStateOf<Dp?>(null) }
         var frozenNavBottom by remember { mutableStateOf<Dp?>(null) }
@@ -388,7 +386,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             val gradientSubTarget = gradientContentTarget.copy(alpha = 0.7f)
             val gradientContent by animateColorAsState(targetValue = gradientContentTarget, animationSpec = tween(600), label = "coverGradientContent")
             val gradientSubContent by animateColorAsState(targetValue = gradientSubTarget, animationSpec = tween(600), label = "coverGradientSubContent")
-            // 未播放歌词（含逐字未播放部分）更浅：与副标题 0.7 区分，突出当前行
+            // 未播放歌词更浅：与副标题 0.7 区分，突出当前行
             val lyricInactiveTarget = gradientContentTarget.copy(alpha = 0.45f)
             val lyricInactive by animateColorAsState(targetValue = lyricInactiveTarget, animationSpec = tween(600), label = "coverLyricInactive")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
@@ -476,8 +474,6 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                         },
                         enabled = durationMs > 0,
                         track = {
-                        // 已播与未播分段绘制、互不重叠：半透明层叠加会二次混合，
-                        // 在已播段边缘形成一圈深色描边状接缝
                         BoxWithConstraints(Modifier.fillMaxWidth().height(16.dp)) {
                             val lineWidth = maxWidth
                             val frac = sliderFrac.coerceIn(0f, 1f)
@@ -574,8 +570,6 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         val lyricScope = rememberCoroutineScope()
         var follow by remember(lines) { mutableStateOf(true) }
         var resumeFollowJob by remember { mutableStateOf<Job?>(null) }
-        // 同步修复：ViewModel 轮询约 50ms 快照仍有量化台阶，播放中按帧外推，
-        // currentIndex 切换不再晚一拍；暂停/切歌时以外推基准对齐避免跳变
         var basePosMs by remember(lines) { mutableStateOf(positionMs) }
         var baseUptime by remember(lines) { mutableStateOf(android.os.SystemClock.uptimeMillis()) }
         var displayPosMs by remember(lines) { mutableStateOf(positionMs) }

@@ -36,7 +36,7 @@ class PluginRouter(private val manager: PluginManager) {
     }
 
     /**
-     * 搜索项 qualities 为空时（如 bilibili 刻意返回空表、靠 getMusicInfo 补全），
+     * 搜索项 qualities 为空时用 getMusicInfo 补全，
      * 先补全详情再解析；补全失败则回退用原条目直接解析，不阻塞播放。
      */
     private suspend fun maybeEnrich(plugin: MusicPlugin, item: MediaItem): MediaItem {
@@ -54,11 +54,16 @@ class PluginRouter(private val manager: PluginManager) {
     }
 
     /** 按平台名获取当前最新适配器，调用方不应长期持有返回的旧对象 */
-    fun findAdapterByPlatform(platform: String): MusicPlugin? =
-        activeAdapters().firstOrNull { it.platform == platform }
+    fun findAdapterByPlatform(platform: String): MusicPlugin? = resolveAdapter(platform)
 
     fun findAdapterById(id: String): MusicPlugin? =
         manager.plugins().firstOrNull { it.id == id }?.let { adapters[it.id] }
+
+    /** 注册名优先、运行时名兜底解析适配器 */
+    private fun resolveAdapter(platform: String): MusicPlugin? {
+        manager.plugins().firstOrNull { it.name == platform }?.let { adapters[it.id] }?.let { return it }
+        return activeAdapters().firstOrNull { it.platform == platform }
+    }
 
     private fun activeAdapters(): List<MusicPlugin> = manager.plugins().mapNotNull { adapters[it.id] }
 
@@ -81,7 +86,7 @@ class PluginRouter(private val manager: PluginManager) {
 
     /** 指定平台榜单分组：无适配器或插件未实现时返回空列表。 */
     suspend fun topLists(platform: String): List<TopListGroup> {
-        val plugin = activeAdapters().firstOrNull { it.platform == platform } ?: return emptyList()
+        val plugin = resolveAdapter(platform) ?: return emptyList()
         return try {
             plugin.topLists()
         } catch (error: Throwable) {
@@ -95,7 +100,7 @@ class PluginRouter(private val manager: PluginManager) {
 
     /** 指定平台榜单详情：仅请求当前平台插件，确保 id 体系一致 */
     suspend fun topListDetail(platform: String, item: TopListItem, page: Int = 1): SearchPage<MediaItem> {
-        val plugin = activeAdapters().firstOrNull { it.platform == platform } ?: return SearchPage(emptyList())
+        val plugin = resolveAdapter(platform) ?: return SearchPage(emptyList())
         return try {
             plugin.topListDetail(item, page)
         } catch (error: Throwable) {

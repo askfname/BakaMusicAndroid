@@ -77,7 +77,7 @@ data class MediaItem(
     val qualities: Map<String, QualityInfo> = emptyMap(),
     /** 插件返回的完整原始 JSON，用于回传给 getMediaSource/getLyric */
     val rawJson: String? = null,
-    /** 备用播放地址（如 bilibili 的 backupUrl），主源失败时自动切换 */
+    /** 备用播放地址，主源失败时自动切换 */
     val backupUrls: List<String> = emptyList()
 )
 
@@ -110,7 +110,7 @@ data class TopListItem(
     val rawJson: String? = null
 )
 
-/** 播放解析请求超时（20s）：与协程取消区分，超时显示 3003 错误弹窗。 */
+/** 播放解析请求超时：与协程取消区分，超时显示 3003 错误弹窗。 */
 class MediaResolveTimeoutException(message: String) : Exception(message)
 
 /** 插件运行时已被重载/释放：调用方应按平台名重新获取最新适配器重试一次。 */
@@ -123,10 +123,10 @@ interface MusicPlugin {
     val supportedQualities: Set<String>
     suspend fun search(query: String, page: Int): SearchPage<MediaItem>
     suspend fun getMediaSource(item: MediaItem, quality: String): MediaItem?
-    /** 歌曲详情补全（如 bilibili 搜索项 qualities 为空时补音质/封面），不支持返回 null。 */
+    /** 歌曲详情补全，搜索项 qualities 为空时补音质/封面，不支持返回 null。 */
     suspend fun getMusicInfo(item: MediaItem): MediaItem? = null
     /**
-     * 带实际命中音质的播放解析：部分插件会降级返回（如 bilibili 请求 flac 实际命中 320k），
+     * 带实际命中音质的播放解析：部分插件会降级返回，
      * 此时第二分量为插件上报的实际音质键；默认实现沿用请求音质。
      */
     suspend fun getMediaSourceDetailed(item: MediaItem, quality: String): Pair<MediaItem, String>? =

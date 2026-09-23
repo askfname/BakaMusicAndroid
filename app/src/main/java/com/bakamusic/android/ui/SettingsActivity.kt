@@ -170,7 +170,7 @@ class SettingsActivity : ComponentActivity() {
                             loading = true; val result = manager.updateSubscription(item); if (result.isSuccess) {
                             runCatching { MusicSourceService.refreshAll() }
                         }; loading = false; notice =
-                            result.fold({ "${item.name} 更新完成，导入 $it 个插件" }, { "更新失败：${it.message ?: "未知错误"}" }); refresh()
+                            result.fold({ "${item.name} 更新完成，导入 ${it.installed} 个插件${it.skippedNotice()}" }, { "更新失败：${it.message ?: "未知错误"}" }); refresh()
                         }
                     },
                     onDeleteSubscription = { item ->
@@ -214,7 +214,7 @@ class SettingsActivity : ComponentActivity() {
             val url = networkUrl
             networkUrl = ""
             dialog = null
-            scope.launch { loading = true; val result = manager.installNetwork(url); if (result.isSuccess) { runCatching { MusicSourceService.refreshAll() } }; loading = false; notice = result.fold({ "安装完成，导入 $it 个插件" }, { "安装失败：${it.message ?: "未知错误"}" }); if (result.isSuccess) { refresh() } }
+            scope.launch { loading = true; val result = manager.installNetwork(url); if (result.isSuccess) { runCatching { MusicSourceService.refreshAll() } }; loading = false; notice = result.fold({ "安装完成，导入 ${it.installed} 个插件${it.skippedNotice()}" }, { "安装失败：${it.message ?: "未知错误"}" }); if (result.isSuccess) { refresh() } }
         }, { dialog = null })
     }
     notice?.let { text -> AlertDialog(onDismissRequest = { notice = null }, title = { Text("插件管理") }, text = { Text(text) }, confirmButton = { TextButton({ notice = null }) { Text("确定") } }) }
@@ -253,7 +253,7 @@ class SettingsActivity : ComponentActivity() {
     }
     // 列表项位移等于累计位移减去已换位补偿，始终与触摸位置一致
     val currentTranslation = if (dragging) boundedDrag - (position - startSlot) * h else 0f
-    // 拖拽中直接取值显示（与布局同帧提交，避免换位抖动）；松手后通过弹簧动画回位
+    // 拖拽中直接取值显示（与布局同帧提交，避免换位抖动）；松手后回位
     val settleAnim by animateFloatAsState(targetValue = currentTranslation, animationSpec = if (dragging) snap() else spring(), label = "dragSettle")
     val dragScale by animateFloatAsState(targetValue = if (dragging) 1.03f else 1f, animationSpec = spring(), label = "dragScale")
     ListItem(

@@ -110,7 +110,7 @@ object LyricParser {
     fun parse(source: LyricSource?): List<LyricLine> {
         val escaped = source?.rawLrc?.replace("\r", "")?.replace("\\n", "\n")?.replace("\\r", "\n").orEmpty()
         if (escaped.isBlank()) return emptyList()
-        // 与桌面端 autoDecryptLyric 一致：QQ 等来源的 QRC 加密串/QRC XML 先还原为富 QRC 再解析
+        // QQ 等来源的 QRC 加密串/QRC XML 先还原为富 QRC 再解析
         val raw = LyricDecrypt.autoDecryptLyric(escaped)?.replace("\r", "").orEmpty()
         if (raw.isBlank()) return emptyList()
         val parsed = mutableListOf<LyricLine>()

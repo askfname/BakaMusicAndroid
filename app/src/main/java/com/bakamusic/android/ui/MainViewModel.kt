@@ -116,8 +116,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
         }
 
-        // 轮询播放状态：歌词行切换依赖 positionMs，200ms 会带来最高 200ms+滚动动画的观感延迟，
-        // 改为 50ms 快照 + LyricsView 帧级外推，行切换与音乐对齐；会话落盘周期保持 5s 不变
         viewModelScope.launch {
             var pollTick = 0
             while (true) {
@@ -265,7 +263,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         return@withContext null
                     }
-                // res 由详情补全后的条目拷贝而来（如 bilibili 的完整音质表/rawJson），展示与缓存均用它
+                // res 由详情补全后的条目拷贝而来，展示与缓存均用它
                 val displayItem = res.copy(mediaUrl = null, mediaHeaders = emptyMap())
                 val backups = res.backupUrls.filter { it != url }
                 NowPlaying(displayItem, url, actualQuality, res.qualities[actualQuality]?.size, res.mediaHeaders, loading = false, backupUrls = backups).also {

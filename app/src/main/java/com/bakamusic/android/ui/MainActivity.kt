@@ -267,9 +267,9 @@ private fun showSystemBars(window: Window) {
                 lyricFullscreen = false
             }
         }
-        // 全屏覆盖层（Activity 窗口内）：独立 Dialog 建窗时系统栏先显后隐会闪烁，故不用 Dialog
+        // 全屏覆盖层（Activity 窗口内）：独立 Dialog 建窗时系统栏先显后隐会闪烁
         BackHandler { dismissLyricAnimated() }
-        // 与音乐播放器界面一样的封面取色对角线渐变背景（含切换时的平滑过渡）
+        // 与音乐播放器界面一样的封面取色对角线渐变背景
         val (lyricGradientStart, lyricGradientEnd) = rememberCoverGradientColors(viewModel.nowPlaying?.item?.artwork)
         val lyricLight = (lyricGradientStart.luminance() + lyricGradientEnd.luminance()) / 2f > 0.6f
         val lyricOverlayView = LocalView.current
@@ -283,8 +283,10 @@ private fun showSystemBars(window: Window) {
             }
             val lyricWindow = lyricActivity?.window
             lyricWindow?.let { hideSystemBars(it); applyGradientBarIcons(it, lyricLight) }
+            // 全屏歌词常亮
+            lyricOverlayView.keepScreenOn = true
             onDispose {
-                // 底下播放器覆盖层仍开着，恢复成与它一致的渐变图标色，而不是主题默认，否则会反转
+                lyricOverlayView.keepScreenOn = false
                 lyricWindow?.let { showSystemBars(it); applyGradientBarIcons(it, lyricLight) }
             }
         }
@@ -296,7 +298,7 @@ private fun showSystemBars(window: Window) {
                     onClick = {}
                 )
         ) {
-            // 打开首帧快照一次导航栏高度并永久冻结，进入动画隐藏系统栏时内容不再上跳
+            // 打开首帧快照一次导航栏高度并永久冻结
             val lyricDensity = LocalDensity.current
             var frozenLyricNavBottom by remember { mutableStateOf<Dp?>(null) }
             if (frozenLyricNavBottom == null) {
@@ -321,7 +323,7 @@ private fun showSystemBars(window: Window) {
             val lyricSubTarget = lyricContentTarget.copy(alpha = 0.7f)
             val lyricContent by animateColorAsState(targetValue = lyricContentTarget, animationSpec = tween(600), label = "lyricContent")
             val lyricSubContent by animateColorAsState(targetValue = lyricSubTarget, animationSpec = tween(600), label = "lyricSubContent")
-            // 全屏未播放歌词（含逐字未播放部分）更浅，与副标题 0.7 区分
+            // 全屏未播放歌词更浅，与副标题 0.7 区分
             val lyricInactiveTarget = lyricContentTarget.copy(alpha = 0.45f)
             val lyricInactive by animateColorAsState(targetValue = lyricInactiveTarget, animationSpec = tween(600), label = "lyricInactive")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {

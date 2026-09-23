@@ -80,6 +80,7 @@ class QuickJsPluginRuntime(private val manager: PluginManager) {
                 active[plugin.id] = instance
                 val initFuture = submit { instance.initialize() }
                 try { initFuture.get() } finally { pending.remove(initFuture) }
+                // 安装名即注册名，不做运行时回写
                 plugin to instance
             }.onFailure {
                 active.remove(plugin.id)?.let { failed -> runCatching { submit { failed.close() }.get() } }
@@ -137,7 +138,8 @@ class QuickJsPluginRuntime(private val manager: PluginManager) {
             // 所用 QuickJS 绑定不支持异步任务，插件源码需剥离 async/await 为同步调用
             //（配套的同步 Promise 兼容实现见 runtimeBootstrap）。
             context.executeVoidScript(runtimeBootstrap(), "quickjs-runtime.js")
-            val wrappedSource = "var exports = module.exports;\n${patchQishuiPlayback(patchKuwoTopListDetail(patchNeteaseSearchBloat(source)))}"
+            // 仅补齐 __musicfree_require 别名（其余全局已由运行时提供，重复声明会与插件顶层变量冲突）。
+            val wrappedSource = "var exports = module.exports;\nvar __musicfree_require = typeof require !== 'undefined' ? require : globalThis.__musicfree_require;\n${patchQishuiPlayback(patchKuwoTopListDetail(patchNeteaseSearchBloat(source)))}"
             val module = context.executeModuleScript(stripAsyncAwait(wrappedSource), "${metadata.name}.js")
             // 缺失的导出键返回 Undefined 而非 null，仅当 default 为有效对象时使用
             val exportsObj = module.getObject("exports")?.takeIf { !it.isUndefined }
@@ -355,7 +357,27 @@ function getTopListDetail(topListItem) {"""
                                 var p = m
                                 while (p < n && source[p].isWhitespace()) p++
                                 val identFollowedByParen = nextWord.isNotEmpty() && nextWord != "function" && p < n && source[p] == '('
-                                if (nextIsParen || nextIsQuotedName || nextWord == "function" || identFollowedByParen) {
+                                // async 箭头函数同样剥离 async
+                                val arrowAfterIdent = nextWord.isNotEmpty() && nextWord != "function" &&
+                                    (source.startsWith("=>", p) || runCatching {
+                                        var q = p
+                                        if (q < n && source[q] == '?') q++
+                                        source.startsWith("=>", q)
+                                    }.getOrDefault(false))
+                                val arrowAfterParen = nextIsParen && runCatching {
+                                    var depth = 0; var q = k
+                                    while (q < n) {
+                                        val ch = source[q]
+                                        if (ch == '(') depth++
+                                        else if (ch == ')') { depth--; if (depth == 0) { q++; break } }
+                                        else if (ch == '\'' || ch == '"' || ch == '`') break
+                                        q++
+                                    }
+                                    while (q < n && source[q].isWhitespace()) q++
+                                    source.startsWith("=>", q)
+                                }.getOrDefault(false)
+                                if (nextIsParen || nextIsQuotedName || nextWord == "function" || identFollowedByParen ||
+                                    arrowAfterIdent || arrowAfterParen) {
                                     i = k; continue
                                 }
                             }
@@ -363,6 +385,20 @@ function getTopListDetail(topListItem) {"""
                                 var k2 = j
                                 while (k2 < n && source[k2].isWhitespace()) k2++
                                 i = k2; continue
+                            }
+                            // for await 剥离为 for
+                            if (word == "for" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
+                                var k3 = j
+                                while (k3 < n && source[k3].isWhitespace()) k3++
+                                if (source.startsWith("await", k3) && (k3 + 5 >= n || !isId(source[k3 + 5]))) {
+                                    var k4 = k3 + 5
+                                    while (k4 < n && source[k4].isWhitespace()) k4++
+                                    if (k4 < n && source[k4] == '(') {
+                                        out.append(word); out.append(' ')
+                                        lastCode = 'r'; lastWord = word
+                                        i = k4; continue
+                                    }
+                                }
                             }
                             out.append(word)
                             for (t in i until j) if (!source[t].isWhitespace()) lastCode = source[t]
@@ -501,9 +537,9 @@ function getTopListDetail(topListItem) {"""
             )
         }
 
-        /** 单次播放解析超时：20s，超时抛出 MediaResolveTimeoutException */
+        /** 单次播放解析超时，超时抛出 MediaResolveTimeoutException */
         private val mediaSourceTimeoutMs = 20_000L
-        /** 详情补全超时：最佳努力，超时返回 null 并直接走播放解析，不阻塞整体 50s 预算 */
+        /** 详情补全超时：最佳努力，超时返回 null 并直接走播放解析 */
         private val musicInfoTimeoutMs = 10_000L
         /** 未完成的播放解析任务：新请求到来时取消旧任务，避免单线程排队阻塞 */
         private val mediaCalls = ConcurrentHashMap.newKeySet<Future<*>>()
@@ -529,7 +565,7 @@ function getTopListDetail(topListItem) {"""
             resolveMediaSource(item, quality)
 
         /**
-         * 歌曲详情补全：qualities 为空的搜索项（如 bilibili）在播放/下载前先取详情，
+         * 歌曲详情补全：qualities 为空的搜索项在播放/下载前先取详情，
          * 否则音质选择器只能看到 320k 且降级顺序失去依据。超时或失败返回 null。
          */
         override suspend fun getMusicInfo(item: MediaItem): MediaItem? {
@@ -684,7 +720,49 @@ function getTopListDetail(topListItem) {"""
             }
         }.getOrNull()
 
-        override suspend fun importMusicSheet(urlLike: String): PlaylistSnapshot? = null
+        override suspend fun importMusicSheet(urlLike: String): PlaylistSnapshot? {
+            // 未实现该方法的插件直接返回 null，由路由尝试下一个插件
+            val hasMethod = runCatching {
+                withTimeout(5_000) {
+                    val call = executorSubmit {
+                        if (closed) throw StalePluginException("$platformName 运行时已重载")
+                        !pluginObject.isUndefined && runCatching { pluginObject.contains("importMusicSheet") }.getOrDefault(false)
+                    }
+                    pendingCalls.add(call)
+                    try { awaitCancellable(call) } finally { pendingCalls.remove(call) }
+                }
+            }.getOrDefault(false)
+            if (!hasMethod) return null
+            val value = try {
+                invoke("importMusicSheet", urlLike, timeoutMs = 30_000)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.d("BakaPlugin", "$platformName.importMusicSheet 失败: ${e.message}")
+                return null
+            }
+            if (value.length() == 0 || value.has("__error")) return null
+            // 数组或对象统一归一为 PlaylistSnapshot
+            val musicArray = value.optJSONArray("musicList")
+                ?: value.optJSONArray("data")
+                ?: value.optJSONArray("songs")
+                ?: JSONArray()
+            val songs = buildList {
+                for (i in 0 until musicArray.length()) {
+                    musicArray.optJSONObject(i)?.let { add(toMedia(it)) }
+                }
+            }
+            if (songs.isEmpty()) return null
+            val id = value.optString("id").ifBlank { value.optString("dissid") }.ifBlank { urlLike }
+            return PlaylistSnapshot(
+                id = id,
+                platform = value.optString("platform").ifBlank { platformName },
+                title = value.optString("title").ifBlank { value.optString("dissname") }.ifBlank { value.optString("dirname") }.ifBlank { "导入歌单" },
+                artist = value.optString("artist").ifBlank { value.optString("nickname") }.ifBlank { value.optString("creator") }.takeIf(String::isNotBlank),
+                artwork = value.optString("artwork").ifBlank { value.optString("logo") }.ifBlank { value.optString("picurl") }.ifBlank { value.optString("cover") }.takeIf(String::isNotBlank),
+                musicList = songs
+            )
+        }
 
         override fun cancelPendingRequests() {
             mediaCalls.toList().forEach { runCatching { it.cancel(true) } }
@@ -703,6 +781,12 @@ function getTopListDetail(topListItem) {"""
                 val call = executorSubmit {
                     // 已关闭实例不再访问 JNI，直接抛出异常，由上层重新获取最新适配器重试
                     if (closed) throw StalePluginException("$platformName 运行时已重载")
+                    // 未实现的可选方法返回空对象，避免 not a function 中断调用
+                    val hasMethod = runCatching { !pluginObject.isUndefined && pluginObject.contains(method) }.getOrDefault(false)
+                    if (!hasMethod) {
+                        Log.d("BakaPlugin", "$platformName.$method 未实现，跳过")
+                        return@executorSubmit JSONObject()
+                    }
                     // 参数直接按类型传递，避免装箱后类型丢失导致传入 JS 的参数全为 null
                     val callArgs = JSArray(context)
                     args.forEach { value -> pushArg(callArgs, value) }
@@ -763,7 +847,6 @@ function getTopListDetail(topListItem) {"""
         /**
          * JS 数值经 QuickJS→JSONObject 桥接后，大 id 会变成 Double，
          * optString/toString 会得到科学计数法（如 3.342319503E9）或带 .0 后缀，
-         * 回传给插件请求 API 时服务端返回 No URL。桌面端（Node 内 String(id)）不存在此问题。
          * 此处统一还原为纯整数文本；hash 等非纯数字标识不受影响。
          */
         private fun normalizePluginId(raw: Any?): String {
@@ -787,7 +870,7 @@ function getTopListDetail(topListItem) {"""
             return s
         }
 
-        /** 备用 CDN（如 bilibili backupUrl/backupUrls）：主源 403/断连时播放器侧自动切换 */
+        /** 备用 CDN：主源 403/断连时播放器侧自动切换 */
         private fun parseBackupUrls(obj: JSONObject): List<String> = buildList {
             fun addUrl(v: Any?) { if (v is String && v.startsWith("http", true)) add(v) }
             listOf(obj.opt("backupUrls"), obj.opt("backupUrl")).forEach { field ->
@@ -810,7 +893,7 @@ function getTopListDetail(topListItem) {"""
         /**
          * 回传 id 恢复数字类型：插件原始 JSON 中的数字 id 经桥接全变字符串，
          * 而 QQ 等接口对 songID 做严格类型校验（字符串直接报 10006），
-         * 导致新歌词接口失败并降级到无逐字的旧接口。桌面端传递原生数字类型，
+         * 导致新歌词接口失败并降级到无逐字的旧接口，
          * 此处对纯整数 id 同样放回数字（其余保持字符串，避免前导零等变形）。
          */
         private fun putPluginId(obj: JSONObject, id: String) {
@@ -819,7 +902,7 @@ function getTopListDetail(topListItem) {"""
             else obj.put("id", id)
         }
 
-        /** 新音质→旧插件兼容音质键（与桌面端 newToLegacyQualityMap 一致），旧插件无此概念时返回 null。 */
+        /** 新音质→旧插件兼容音质键，旧插件无此概念时返回 null。 */
         private fun legacyQualityOf(key: String): String? = when (key) {
             "96k", "128k" -> "low"
             "192k" -> "standard"
@@ -873,7 +956,7 @@ function getTopListDetail(topListItem) {"""
                 }
             }
             val duration = obj.optDouble("duration", 0.0)
-            // 备用 CDN（如 bilibili backupUrl）：主源 403/断连时播放器侧自动切换
+            // 备用 CDN：主源 403/断连时播放器侧自动切换
             val backups = parseBackupUrls(obj)
             return MediaItem(
             id = normalizePluginId(obj.opt("id")).ifBlank { normalizePluginId(obj.opt("songmid")) }.ifBlank { normalizePluginId(obj.opt("songid")) },
@@ -893,10 +976,13 @@ function getTopListDetail(topListItem) {"""
 
         private inner class HttpBridge {
             private val open = ConcurrentHashMap.newKeySet<HttpURLConnection>()
-            /** host 熔断：连续传输层失败 2 次后 60s 内直接快速失败（签名服务挂掉时不再每首歌烧 10s）。 */
+            /** host 熔断：连续传输层失败 2 次后 60s 内直接快速失败。 */
             private val hostFailStreak = ConcurrentHashMap<String, Int>()
             private val hostBreakerUntil = ConcurrentHashMap<String, Long>()
             private val breakerWindowMs = 60_000L
+            /** 插件未指定 UA 时的默认值 */
+            private val DEFAULT_PLUGIN_UA =
+                "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36 BakaMusic/1.0"
 
             fun cancelAll() { open.toList().forEach { runCatching { it.disconnect() } }; open.clear() }
 
@@ -916,8 +1002,6 @@ function getTopListDetail(topListItem) {"""
             /**
              * 插件 HTTP 执行：首试复用连接，遇连接复用类错误
              * （unexpected end of stream / Connection reset）时用 Connection:close 再试一次。
-             * OkHttp 连接池复用的半关闭连接是汽水 track_v2 高频 RST 的主因
-             * （同插件 Dart 客户端走 HTTP/1.1 无此问题）。
              */
             private fun executeWithRetry(configText: String): String {
                 val config = JSONObject(configText)
@@ -938,8 +1022,12 @@ function getTopListDetail(topListItem) {"""
                 require(!isPluginPrivateHost(host)) { "插件不能访问本机或内网地址" }
                 val method = config.optString("method", "GET").uppercase()
                 val isBinary = config.optString("responseType").equals("arraybuffer", true) || config.optString("responseType").equals("blob", true)
-                // 尊重 JS 指定的超时（如 track_v2 20s），钳制在 3s~60s；整体仍受上层 50s 预算约束
+                // JS 指定的超时（如 track_v2 20s），钳制在 3s~60s；整体仍受上层 50s 预算约束
                 val timeoutMs = runCatching { config.optInt("timeout", 15_000) }.getOrDefault(15_000).coerceIn(3_000, 60_000)
+                // 默认跟随 5 次重定向，与 axios 默认语义对齐
+                val maxRedirects = if (config.has("maxRedirects")) {
+                    runCatching { config.optInt("maxRedirects", 5) }.getOrDefault(5).coerceIn(0, 20)
+                } else 5
                 val headers = config.optJSONObject("headers")
                 val data = config.opt("data")
                 val hasBody = data != null && data != JSONObject.NULL && method !in setOf("GET", "HEAD")
@@ -975,7 +1063,7 @@ function getTopListDetail(topListItem) {"""
                     }
                 }
                 val hostPath = host + runCatching { URI(url).path }.getOrDefault("")
-                // 熔断：该 host 连续传输层失败后快速失败，不在已死的签名服务上烧预算
+                // 熔断：该 host 连续传输层失败后快速失败
                 if ((hostBreakerUntil[host] ?: 0L) > System.currentTimeMillis()) {
                     Log.d("BakaPlugin", "[$platformName][http] $method $hostPath 熔断快速失败")
                     return JSONObject().put("__error", "网络暂不可用，快速回落").toString()
@@ -985,7 +1073,7 @@ function getTopListDetail(topListItem) {"""
                     try {
                         val result = exchangeOnce(
                             url, hostPath, method, headers, contentType,
-                            bodyBytes, bodyKind, hasBody, isBinary, timeoutMs,
+                            bodyBytes, bodyKind, hasBody, isBinary, timeoutMs, maxRedirects,
                             closeConnection = attempt == 1
                         )
                         hostFailStreak.remove(host)
@@ -1018,31 +1106,69 @@ function getTopListDetail(topListItem) {"""
                 hasBody: Boolean,
                 isBinary: Boolean,
                 timeoutMs: Int,
+                maxRedirects: Int,
                 closeConnection: Boolean
             ): String {
-                val conn = URI(url).toURL().openConnection() as HttpURLConnection
-                open.add(conn)
+                // 手动跟随重定向（HttpURLConnection 不跟随 POST 等，与 axios 语义对齐）
+                var currentUrl = url
+                var currentMethod = method
+                var currentBody = bodyBytes
+                var currentHasBody = hasBody
+                var redirectCount = 0
                 val start = System.currentTimeMillis()
-                try {
-                    conn.connectTimeout = timeoutMs; conn.readTimeout = timeoutMs; conn.instanceFollowRedirects = true
-                    conn.requestMethod = method
-                    var hasConnectionHeader = false
-                    headers?.keys()?.forEach { key ->
-                        if (key.equals("Connection", true)) hasConnectionHeader = true
-                        conn.setRequestProperty(key, headers.optString(key))
-                    }
-                    // 重试时禁用 keep-alive 复用，强制走新连接
-                    if (closeConnection && !hasConnectionHeader) conn.setRequestProperty("Connection", "close")
-                    if (hasBody && bodyBytes != null) {
-                        conn.doOutput = true
-                        if (contentType.isBlank()) conn.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
-                        conn.outputStream.use { it.write(bodyBytes) }
-                    }
-                    val code = conn.responseCode
-                    val finalUrl = conn.url?.toString() ?: url
-                    require(finalUrl.startsWith("http://", true) || finalUrl.startsWith("https://", true)) { "插件重定向地址无效" }
-                    val finalHost = URI(finalUrl).host?.lowercase() ?: throw IllegalArgumentException("插件重定向地址无效")
-                    require(!isPluginPrivateHost(finalHost)) { "插件不能重定向到本机或内网地址" }
+                while (true) {
+                    val conn = URI(currentUrl).toURL().openConnection() as HttpURLConnection
+                    open.add(conn)
+                    try {
+                        conn.connectTimeout = timeoutMs; conn.readTimeout = timeoutMs; conn.instanceFollowRedirects = false
+                        conn.requestMethod = currentMethod
+                        var hasConnectionHeader = false
+                        var hasUserAgent = false
+                        var hasAccept = false
+                        var hasAcceptEncoding = false
+                        headers?.keys()?.forEach { key ->
+                            if (key.equals("Connection", true)) hasConnectionHeader = true
+                            if (key.equals("User-Agent", true)) hasUserAgent = true
+                            if (key.equals("Accept", true)) hasAccept = true
+                            if (key.equals("Accept-Encoding", true)) hasAcceptEncoding = true
+                            conn.setRequestProperty(key, headers.optString(key))
+                        }
+                        // 插件未指定时补默认请求头（部分网关拒绝无 UA 请求）
+                        if (!hasUserAgent) conn.setRequestProperty("User-Agent", DEFAULT_PLUGIN_UA)
+                        if (!hasAccept) conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+                        if (!hasAcceptEncoding) conn.setRequestProperty("Accept-Encoding", "gzip, deflate")
+                        // 重试时禁用 keep-alive 复用，强制走新连接
+                        if (closeConnection && !hasConnectionHeader) conn.setRequestProperty("Connection", "close")
+                        if (currentHasBody && currentBody != null) {
+                            conn.doOutput = true
+                            if (contentType.isBlank()) conn.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
+                            conn.outputStream.use { it.write(currentBody) }
+                        }
+                        val code = conn.responseCode
+                        if (code in arrayOf(301, 302, 303, 307, 308) && redirectCount < maxRedirects) {
+                            // Location 匹配大小写不敏感
+                            val location = conn.headerFields.entries
+                                .firstOrNull { it.key?.equals("Location", true) == true }
+                                ?.value?.firstOrNull()?.trim()
+                                ?: conn.getHeaderField("Location")?.trim()
+                            if (!location.isNullOrEmpty()) {
+                                val nextUrl = runCatching { URI(currentUrl).resolve(encodeUrlInline(location)).toString() }
+                                    .getOrDefault(location)
+                                require(nextUrl.startsWith("http://", true) || nextUrl.startsWith("https://", true)) { "插件重定向地址无效" }
+                                val nextHost = URI(nextUrl).host?.lowercase() ?: throw IllegalArgumentException("插件重定向地址无效")
+                                require(!isPluginPrivateHost(nextHost)) { "插件不能重定向到本机或内网地址" }
+                                // 301/302/303 的 POST 转 GET；307/308 保持不变
+                                if (code == 303 || ((code == 301 || code == 302) && currentMethod == "POST")) {
+                                    currentMethod = "GET"; currentBody = null; currentHasBody = false
+                                }
+                                currentUrl = nextUrl
+                                redirectCount++
+                                continue
+                            }
+                        }
+                        val finalUrl = currentUrl
+                        val finalHost = URI(finalUrl).host?.lowercase() ?: throw IllegalArgumentException("插件重定向地址无效")
+                        require(!isPluginPrivateHost(finalHost)) { "插件不能重定向到本机或内网地址" }
                     val input = if (code in 200..299) conn.inputStream else (conn.errorStream ?: conn.inputStream)
                     require(conn.contentLengthLong <= 16L * 1024 * 1024 || conn.contentLengthLong < 0) { "响应超过 16 MiB 限制" }
                     val encoding = (conn.contentEncoding ?: "").lowercase()
@@ -1069,13 +1195,14 @@ function getTopListDetail(topListItem) {"""
                         if (!key.isNullOrBlank() && !values.isNullOrEmpty()) responseHeaders.put(key, values.joinToString(","))
                     }
                     val ms = System.currentTimeMillis() - start
-                    if (method == "POST" || ms > 2000) {
-                        Log.d("BakaPlugin", "[$platformName][http] $method $hostPath code=$code ${ms}ms req=${bodyBytes?.size ?: 0}B($bodyKind) resp=${bytes.size}B")
+                    if (method == "POST" || ms > 2000 || redirectCount > 0) {
+                        Log.d("BakaPlugin", "[$platformName][http] $method $hostPath code=$code ${ms}ms req=${bodyBytes?.size ?: 0}B($bodyKind) resp=${bytes.size}B redirects=$redirectCount")
                     }
                     return JSONObject().put("status", code).put("headers", responseHeaders).put("data", dataValue).toString()
                 } finally {
                     open.remove(conn)
                     runCatching { conn.disconnect() }
+                }
                 }
             }
 
@@ -1143,9 +1270,20 @@ function getTopListDetail(topListItem) {"""
             @JavascriptInterface fun md5(value: String) = digest("MD5", value)
             @JavascriptInterface fun sha1(value: String) = digest("SHA-1", value)
             @JavascriptInterface fun sha256(value: String) = digest("SHA-256", value)
+            @JavascriptInterface fun sha512(value: String) = digest("SHA-512", value)
             @JavascriptInterface fun hmacSha256(key: String, value: String): String = runCatching {
                 val mac = javax.crypto.Mac.getInstance("HmacSHA256")
                 mac.init(javax.crypto.spec.SecretKeySpec(key.toByteArray(), "HmacSHA256"))
+                mac.doFinal(value.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
+            }.getOrDefault("")
+            @JavascriptInterface fun hmacSha1(key: String, value: String): String = runCatching {
+                val mac = javax.crypto.Mac.getInstance("HmacSHA1")
+                mac.init(javax.crypto.spec.SecretKeySpec(key.toByteArray(), "HmacSHA1"))
+                mac.doFinal(value.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
+            }.getOrDefault("")
+            @JavascriptInterface fun hmacMd5(key: String, value: String): String = runCatching {
+                val mac = javax.crypto.Mac.getInstance("HmacMD5")
+                mac.init(javax.crypto.spec.SecretKeySpec(key.toByteArray(), "HmacMD5"))
                 mac.doFinal(value.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
             }.getOrDefault("")
             @JavascriptInterface fun modPowHex(baseHex: String, expHex: String, modHex: String): String = runCatching {
@@ -1199,6 +1337,16 @@ function getTopListDetail(topListItem) {"""
                 else cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, secret, javax.crypto.spec.IvParameterSpec(iv.toByteArray().copyOf(16)))
                 android.util.Base64.encodeToString(cipher.doFinal(plain.toByteArray()), android.util.Base64.NO_WRAP)
             }.getOrDefault("")
+            /** AES 解密，供 CryptoJS.AES.decrypt 使用 */
+            @JavascriptInterface fun aesDecrypt(mode: String, key: String, iv: String, base64Cipher: String): String = runCatching {
+                val cipher = javax.crypto.Cipher.getInstance("AES/${mode.uppercase()}/PKCS5Padding")
+                val secret = javax.crypto.spec.SecretKeySpec(normalizeAesKey(key.toByteArray()), "AES")
+                if (mode.equals("ECB", true)) cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secret)
+                else cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secret, javax.crypto.spec.IvParameterSpec(iv.toByteArray().copyOf(16)))
+                val bytes = android.util.Base64.decode(base64Cipher, android.util.Base64.DEFAULT)
+                require(bytes.size <= 8 * 1024 * 1024) { "aesDecrypt 输入超限" }
+                String(cipher.doFinal(bytes), Charsets.UTF_8)
+            }.getOrDefault("")
 
             private fun normalizeAesKey(bytes: ByteArray): ByteArray {
                 if (bytes.size == 16 || bytes.size == 24 || bytes.size == 32) return bytes
@@ -1222,10 +1370,14 @@ function getTopListDetail(topListItem) {"""
         /** 同步运行时兼容实现：提供同步 Promise、任意值的 then/catch、同步 setTimeout，与 stripAsyncAwait 配套使用。 */
         private fun runtimeBootstrap(): String = """
             var __root = this;
-            function setTimeout(fn){ fn(); return 0; }
+            function setTimeout(fn){ try { if (typeof fn === 'function') fn(); } catch (e) {} return 0; }
             function clearTimeout(id) {}
+            function setInterval(fn){ return 0; }
+            function clearInterval(id) {}
             __root.setTimeout = setTimeout;
             __root.clearTimeout = clearTimeout;
+            __root.setInterval = setInterval;
+            __root.clearInterval = clearInterval;
             function __BakaRejected(err){ this.__baka_error = err; }
             __BakaRejected.prototype.then = function(onF, onR){
               if (typeof onR === 'function') {
@@ -1256,6 +1408,7 @@ function getTopListDetail(topListItem) {"""
               try { executor(resolve, reject); } catch (e) { reject(e); }
             }
             Promise.resolve = function(v){ return (v instanceof Promise) ? v._v : v; };
+            Promise.reject = function(e){ return new __BakaRejected(e); };
             Promise.all = function(values){
               var out = []; var list = values || [];
               for (var i = 0; i < list.length; i++) {
@@ -1263,6 +1416,26 @@ function getTopListDetail(topListItem) {"""
                 if (v instanceof Promise) v = v._v;
                 if (v instanceof __BakaRejected) throw v.__baka_error;
                 out.push(v);
+              }
+              return out;
+            };
+            Promise.race = function(values){
+              var list = values || [];
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (!(v instanceof __BakaRejected)) return v;
+              }
+              if (list.length) { var last = list[list.length - 1]; return (last instanceof Promise) ? last._v : last; }
+              return undefined;
+            };
+            Promise.allSettled = function(values){
+              var out = []; var list = values || [];
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (v instanceof __BakaRejected) out.push({status: 'rejected', reason: v.__baka_error});
+                else out.push({status: 'fulfilled', value: v});
               }
               return out;
             };
@@ -1291,9 +1464,12 @@ function getTopListDetail(topListItem) {"""
             CryptoJs.MD5 = function(value){ return hash('md5', value); };
             CryptoJs.SHA1 = function(value){ return hash('sha1', value); };
             CryptoJs.SHA256 = function(value){ return hash('sha256', value); };
+            CryptoJs.SHA512 = function(value){ return hash('sha512', value); };
             CryptoJs.HmacSHA256 = function(value, key){ return new HashValue(BakaHttp.hmacSha256(String(key), String(value)), 'hex'); };
+            CryptoJs.HmacSHA1 = function(value, key){ return new HashValue(BakaHttp.hmacSha1(String(key), String(value)), 'hex'); };
+            CryptoJs.HmacMD5 = function(value, key){ return new HashValue(BakaHttp.hmacMd5(String(key), String(value)), 'hex'); };
             CryptoJs.enc = {
-              Utf8: {parse: function(value){ return new HashValue(value, 'utf8'); }},
+              Utf8: {parse: function(value){ return new HashValue(value, 'utf8'); }, stringify: function(value){ return String(value.value || value); }},
               Hex: {parse: function(value){ return new HashValue(value, 'hex'); }, stringify: function(value){ return String(value.value || value); }},
               Base64: {parse: function(value){ return new HashValue(__bakaUtf8Decode(atob(String(value))), 'utf8'); }, stringify: function(value){ return String(value.value || value); }}
             };
@@ -1304,6 +1480,12 @@ function getTopListDetail(topListItem) {"""
               var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
               var cipher = new HashValue(BakaHttp.aes(mode, String(key.value || key), iv, String(value.value || value)), 'base64');
               return {ciphertext: cipher, toString: function(){ return cipher.toString(); }};
+            }, decrypt: function(cipher, key, config){
+              var mode = config && config.mode && config.mode.name ? config.mode.name : 'CBC';
+              var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
+              var ctext = (cipher && cipher.ciphertext) ? String(cipher.ciphertext.value || cipher.ciphertext) : String(cipher);
+              var plain = BakaHttp.aesDecrypt(mode, String(key.value || key), iv, ctext);
+              return {toString: function(fmt){ if (fmt === CryptoJs.enc.Utf8 || fmt === undefined) return plain; if (fmt === CryptoJs.enc.Hex) return __bakaBinToHex(__bakaUtf8Encode(plain)); if (fmt === CryptoJs.enc.Base64) return btoa(__bakaUtf8Encode(plain)); return plain; }};
             }};
             function atob(value){
               var table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
@@ -1372,16 +1554,26 @@ function getTopListDetail(topListItem) {"""
               self.searchParams = {set: function(key, val){
                 var part = encodeURIComponent(key) + '=' + encodeURIComponent(val);
                 self.href += (self.href.indexOf('?') >= 0 ? '&' : '?') + part;
-              }, get: function(){ return null; }};
+              }, get: function(key){
+                try { var m = self.href.match(/[?&]([^#]*)/); if (!m) return null; var pairs = m[1].split('&'); for (var i = 0; i < pairs.length; i++) { var kv = pairs[i].split('='); if (decodeURIComponent(kv[0]) === String(key)) return kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=')) : ''; } } catch (e) {}
+                return null;
+              }, append: function(key, val){ this.set(key, val); }};
+              Object.defineProperty(self, 'search', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/\?([^#]*)/); return m ? ('?' + m[1]) : ''; }});
+              Object.defineProperty(self, 'origin', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/^(https?:\/\/[^/?#]+)/i); return m ? m[1] : ''; }});
               self.toString = function(){ return self.href; };
             }
             globalThis.URL = URL; globalThis.CryptoJS = CryptoJs; globalThis.CryptoJs = CryptoJs;
+            // 补齐桌面端透传的 env/process 全局，缺失会导致 ReferenceError
+            try {
+              if (typeof process === 'undefined') { globalThis.process = {platform: 'android', version: '1.0.0', env: {}}; }
+              if (typeof env === 'undefined') { globalThis.env = {}; }
+            } catch (e) {}
         """.trimIndent()
 
         private fun moduleScripts(): Map<String, String> = mapOf(
             "axios" to """
                 var axios=function(c){var cfg=c||{};var __d=cfg&&cfg.data;if(__d&&typeof Uint8Array!=='undefined'&&__d instanceof Uint8Array){var __bin='';for(var __i=0;__i<__d.length;__i++)__bin+=String.fromCharCode(__d[__i]);try{cfg=Object.assign({},cfg,{data:{__bytes_base64:btoa(__bin)}});}catch(__e){}}var r=JSON.parse(BakaHttp.request(JSON.stringify(cfg)));if(r.__error)throw new Error(r.__error);var ok=cfg.validateStatus?cfg.validateStatus(r.status):r.status>=200&&r.status<300;if(!ok){var err=new Error('Request failed with status code '+r.status);err.response={status:r.status,data:r.data,headers:r.headers||{}};throw err;}var d=r.data;var tr=cfg.transformResponse;if(tr){var fns=Array.isArray(tr)?tr:[tr];for(var i=0;i<fns.length;i++){if(typeof fns[i]==='function')d=fns[i](d);}}if(d&&d.__base64){var raw=atob(d.__base64),u=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);d=u;}return {data:d,status:r.status,statusText:String(r.status),headers:r.headers||{},config:cfg};};
-                axios.request=axios;axios.get=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'GET'}));};axios.post=function(u,d,c){return axios(Object.assign({},c||{},{url:u,method:'POST',data:d}));};axios.head=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'HEAD'}));};axios.getUri=function(c){c=c||{};var u=c.url||'';var p=c.params||{};var q=Object.keys(p).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(p[k]);}).join('&');return q?(u+(u.indexOf('?')>=0?'&':'?')+q):u;};axios.all=function(values){return Promise.all(values);};axios.spread=function(fn){return function(values){return fn.apply(null,values);};};axios.default=axios;axios.create=function(def){var inst=function(c){return axios(Object.assign({},def||{},c||{}));};inst.get=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'GET'}));};inst.post=function(u,d,c){return inst(Object.assign({},c||{},{url:u,method:'POST',data:d}));};inst.head=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'HEAD'}));};inst.request=inst;return inst;};module.exports=axios;
+                axios.defaults={};axios.request=axios;axios.get=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'GET'}));};axios.post=function(u,d,c){return axios(Object.assign({},c||{},{url:u,method:'POST',data:d}));};axios.head=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'HEAD'}));};axios.delete=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'DELETE'}));};axios.put=function(u,d,c){return axios(Object.assign({},c||{},{url:u,method:'PUT',data:d}));};axios.patch=function(u,d,c){return axios(Object.assign({},c||{},{url:u,method:'PATCH',data:d}));};axios.options=function(u,c){return axios(Object.assign({},c||{},{url:u,method:'OPTIONS'}));};axios.getUri=function(c){c=c||{};var u=c.url||'';var p=c.params||{};var q=Object.keys(p).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(p[k]);}).join('&');return q?(u+(u.indexOf('?')>=0?'&':'?')+q):u;};axios.all=function(values){return Promise.all(values);};axios.spread=function(fn){return function(values){return fn.apply(null,values);};};axios.default=axios;axios.create=function(def){var inst=function(c){return axios(Object.assign({},def||{},c||{}));};inst.get=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'GET'}));};inst.post=function(u,d,c){return inst(Object.assign({},c||{},{url:u,method:'POST',data:d}));};inst.head=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'HEAD'}));};inst.delete=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'DELETE'}));};inst.put=function(u,d,c){return inst(Object.assign({},c||{},{url:u,method:'PUT',data:d}));};inst.patch=function(u,d,c){return inst(Object.assign({},c||{},{url:u,method:'PATCH',data:d}));};inst.options=function(u,c){return inst(Object.assign({},c||{},{url:u,method:'OPTIONS'}));};inst.request=inst;inst.defaults=axios.defaults;return inst;};module.exports=axios;
             """.trimIndent(),
             "buffer" to "module.exports={Buffer:globalThis.Buffer};",
             "crypto-js" to "module.exports=globalThis.CryptoJs;",
@@ -1395,13 +1587,30 @@ function getTopListDetail(topListItem) {"""
                 __Big.prototype.valueOf=function(){ return this.h; };
                 module.exports=function(v,base){ if(v instanceof __Big)return v; if(typeof v==='number')return new __Big(Math.floor(v).toString(16)); var s=String(v); if(s.substr(0,2)==='0x'||s.substr(0,2)==='0X')s=s.substr(2); return new __Big(s); };
             """.trimIndent(),
-            "qs" to "module.exports={stringify:function(o){return Object.keys(o||{}).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o[k]);}).join('&');}};",
+            "qs" to """
+                function __qsVal(v){ if(v===null||v===undefined)return ''; if(typeof v==='object')return JSON.stringify(v); return String(v); }
+                module.exports={
+                  stringify:function(o,opts){ var out=[]; var src=o||{}; for(var k in src){ if(!Object.prototype.hasOwnProperty.call(src,k))continue; var v=src[k]; if(v===undefined||v===null)continue; if(Array.isArray(v)){ for(var i=0;i<v.length;i++)out.push(encodeURIComponent(k)+'='+encodeURIComponent(__qsVal(v[i]))); } else if(typeof v==='object'){ out.push(encodeURIComponent(k)+'='+encodeURIComponent(JSON.stringify(v))); } else out.push(encodeURIComponent(k)+'='+encodeURIComponent(String(v))); } return out.join('&'); },
+                  parse:function(s){ var out={}; try{ String(s||'').split('&').forEach(function(p){ if(!p)return; var kv=p.split('='); var k=decodeURIComponent(kv[0]); var v=kv.length>1?decodeURIComponent(kv.slice(1).join('=')):''; if(out[k]===undefined)out[k]=v; else if(Array.isArray(out[k]))out[k].push(v); else out[k]=[out[k],v]; }); }catch(e){} return out; }
+                };
+            """.trimIndent(),
             "dayjs" to """
-                function __dayjs(){ return {format:function(){return '';}}; };
-                __dayjs.unix=function(t){ var d=new Date(Number(t)*1000); return {format:function(f){ try{ var s=String(f||''); if(s.indexOf('YYYY')>=0&&s.indexOf('MM')>=0&&s.indexOf('DD')>=0)return d.toISOString().slice(0,10); }catch(e){} return ''; }}; };
+                function __dayjsPad(n){ n=Number(n); return (n<10?'0':'')+n; }
+                function __dayjsFmt(d,f){ try{ var s=String(f||''); var Y=d.getFullYear(),M=__dayjsPad(d.getMonth()+1),D=__dayjsPad(d.getDate()),h=__dayjsPad(d.getHours()),m=__dayjsPad(d.getMinutes()),sec=__dayjsPad(d.getSeconds()); return s.replace(/YYYY/g,Y).replace(/MM/g,M).replace(/DD/g,D).replace(/HH/g,h).replace(/mm/g,m).replace(/ss/g,sec); }catch(e){ return ''; } }
+                function __dayjs(v){ var d=(v===undefined||v===null)?new Date():new Date(v); if(isNaN(d.getTime()))d=new Date(); return {format:function(f){ return __dayjsFmt(d,f); }, valueOf:function(){ return d.getTime(); }, toString:function(){ return d.toString(); }}; };
+                __dayjs.unix=function(t){ var d=new Date(Number(t)*1000); return {format:function(f){ return __dayjsFmt(d,f); }, valueOf:function(){ return d.getTime(); }}; };
                 module.exports=__dayjs;
             """.trimIndent(),
-            "he" to "module.exports={decode:function(v){return String(v);}};",
+            "he" to """
+                function __heDecode(s){
+                  return String(s==null?"":s).replace(/&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g,function(m,e){
+                    if(e.charAt(0)==="#"){ var hex=e.charAt(1)==="x"||e.charAt(1)==="X"; var code=parseInt(hex?e.slice(2):e.slice(1),hex?16:10); if(isFinite(code)){ if(code>65535){code-=65536;return String.fromCharCode(55296+(code>>10),56320+(code&1023));} return String.fromCharCode(code); } return m; }
+                    if(e==="amp")return "&"; if(e==="lt")return "<"; if(e==="gt")return ">"; if(e==="quot")return '"'; if(e==="apos"||e==="#39")return "'"; if(e==="nbsp")return String.fromCharCode(160); return m;
+                  });
+                }
+                function __heEncode(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+                module.exports={decode:__heDecode, encode:__heEncode};
+            """.trimIndent(),
             "pako" to """
                 function __pakoBytes(v){
                     if (typeof v === 'string') { var bin = __bakaUtf8Encode(v); var u = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
@@ -1470,16 +1679,36 @@ function getTopListDetail(topListItem) {"""
                 function __cqMatch(el,sel){
                 if(!el||el.type!=="tag")return false;
                 var s=String(sel||"").replace(/^\s+|\s+$/g,"");
+                if(!s||s==="*")return true;
+                // 去掉伪类，按基础部分匹配
+                s=s.replace(/:(first|last|even|odd|eq\(\d+\)|nth-child\(\d+\)|contains\([^)]*\))/g,"").replace(/^\s+|\s+$/g,"");
                 if(!s)return true;
-                if(s.charAt(0)==="#")return (el.attribs["id"]||"")===s.slice(1);
+                // 属性选择器
+                var attr=null; var attrVal=null; var hasAttr=false;
+                var lb=s.indexOf("[");
+                if(lb>=0){ var rb=s.lastIndexOf("]"); if(rb>lb){ var inside=s.slice(lb+1,rb); s=(s.slice(0,lb)+s.slice(rb+1)).replace(/^\s+|\s+$/g,""); var eq=inside.indexOf("="); if(eq>=0){ attr=inside.slice(0,eq).replace(/^\s+|\s+$/g,"").toLowerCase(); attrVal=inside.slice(eq+1).replace(/^\s+|\s+$/g,"").replace(/^["']|["']$/g,""); } else { attr=inside.replace(/^\s+|\s+$/g,"").toLowerCase(); } hasAttr=true; } }
+                // id 选择器
+                var hash=s.indexOf("#");
+                if(hash>=0){ var after=s.slice(hash+1).split(".")[0].split(" ")[0]; if((el.attribs["id"]||"")!==after)return false; s=(s.slice(0,hash)+" "+s.slice(hash+1+after.length)).replace(/^\s+|\s+$/g,""); if(!s&&!hasAttr)return true; if(!s)return !hasAttr||(attr?(attrVal!=null?(el.attribs[attr]||"")==__cqDecode(attrVal):(el.attribs[attr]!==undefined)):true); }
+                if(!s){ if(!hasAttr)return true; if(attrVal!=null)return (el.attribs[attr]||"")==__cqDecode(attrVal); return el.attribs[attr]!==undefined; }
+                // 支持 tag/.cls/tag.cls、id 与属性选择器
                 var dot=s.indexOf(".");
-                var tag=dot<0?s:s.slice(0,dot);
-                if(tag&&el.name!==tag.toLowerCase())return false;
-                if(dot<0)return true;
+                var tag=dot<0?s:s.slice(0,dot).split(" ")[0];
+                // 后代选择器按最后一节匹配
+                if(tag.indexOf(" ")>=0){ var parts=tag.split(" "); tag=parts[parts.length-1]; }
+                if(tag&&tag!=="*"&&el.name!==tag.toLowerCase())return false;
+                if(dot<0){ if(!hasAttr)return true; if(attrVal!=null)return (el.attribs[attr]||"")==__cqDecode(attrVal); return el.attribs[attr]!==undefined; }
                 var need=s.slice(dot+1).split(".");
                 var cls=" "+(el.attribs["class"]|| "")+" ";
-                for(var i=0;i<need.length;i++){if(need[i]&&cls.indexOf(" "+need[i]+" ")<0)return false;}
-                return true;
+                for(var i=0;i<need.length;i++){ var c=need[i].split(" ")[0]; if(c&&cls.indexOf(" "+c+" ")<0)return false; }
+                if(!hasAttr)return true;
+                if(attrVal!=null)return (el.attribs[attr]||"")==__cqDecode(attrVal);
+                return el.attribs[attr]!==undefined;
+                }
+                function __cqSelChain(root,sel,out){
+                var groups=String(sel||"").split(",");
+                for(var gi=0;gi<groups.length;gi++){ var g=groups[gi].replace(/^\s+|\s+$/g,""); if(!g)continue; var chain=g.split(">").map(function(p){return p.replace(/^\s+|\s+$/g,"");}).filter(function(p){return p;}); if(chain.length<=1){ var parts=g.split(" ").filter(function(p){return p;}); var last=parts.length?parts[parts.length-1]:g; __cqDesc(root,last,out); } else { var cur=[root]; for(var ci=0;ci<chain.length;ci++){ var next=[]; for(var a=0;a<cur.length;a++){ var kids=cur[a].children||[]; for(var b=0;b<kids.length;b++){ if(kids[b].type==="tag"&&__cqMatch(kids[b],chain[ci]))next.push(kids[b]); } } cur=next; } for(var k=0;k<cur.length;k++)out.push(cur[k]); } }
+                return out;
                 }
                 function __cqDesc(el,sel,out){
                 var kids=el.children||[];
@@ -1497,21 +1726,37 @@ function getTopListDetail(topListItem) {"""
                 var arr=[];
                 for(var i=0;i<nodes.length;i++)arr.push(nodes[i]);
                 arr.children=function(sel){var out=[];for(var a=0;a<arr.length;a++){var kids=arr[a].children||[];for(var b=0;b<kids.length;b++){if(kids[b].type==="tag"&&(sel==null||__cqMatch(kids[b],sel)))out.push(kids[b]);}}return __cqWrap(out);};
-                arr.find=function(sel){var out=[];for(var a=0;a<arr.length;a++)__cqDesc(arr[a],sel,out);return __cqWrap(out);};
-                arr.attr=function(name){for(var a=0;a<arr.length;a++){var el=arr[a];if(el&&el.type==="tag"&&el.attribs){var v=el.attribs[String(name).toLowerCase()];if(v!==undefined)return v;}}return undefined;};
+                arr.find=function(sel){var out=[];for(var a=0;a<arr.length;a++){ if(String(sel||"").indexOf(",")>=0||String(sel||"").indexOf(">")>=0||String(sel||"").replace(/^\s+|\s+$/g,"").split(" ").length>1){__cqSelChain(arr[a],sel,out);} else __cqDesc(arr[a],sel,out);}return __cqWrap(out);};
+                arr.parent=function(){var out=[];for(var a=0;a<arr.length;a++){var p=arr[a].parent;if(p&&p.type==="tag"&&out.indexOf(p)<0)out.push(p);}return __cqWrap(out);};
+                arr.parents=function(sel){var out=[];for(var a=0;a<arr.length;a++){var p=arr[a].parent;while(p){if(p.type==="tag"&&(sel==null||__cqMatch(p,sel))&&out.indexOf(p)<0)out.push(p);p=p.parent;}}return __cqWrap(out);};
+                arr.siblings=function(sel){var out=[];for(var a=0;a<arr.length;a++){var p=arr[a].parent;if(!p)continue;var kids=p.children||[];for(var b=0;b<kids.length;b++){if(kids[b].type==="tag"&&kids[b]!==arr[a]&&(sel==null||__cqMatch(kids[b],sel))&&out.indexOf(kids[b])<0)out.push(kids[b]);}}return __cqWrap(out);};
+                arr.next=function(){var out=[];for(var a=0;a<arr.length;a++){var p=arr[a].parent;if(!p)continue;var kids=p.children||[];for(var b=0;b<kids.length;b++){if(kids[b]===arr[a]){for(var c=b+1;c<kids.length;c++){if(kids[c].type==="tag"){out.push(kids[c]);break;}}break;}}}return __cqWrap(out);};
+                arr.prev=function(){var out=[];for(var a=0;a<arr.length;a++){var p=arr[a].parent;if(!p)continue;var kids=p.children||[];for(var b=0;b<kids.length;b++){if(kids[b]===arr[a]){for(var c=b-1;c>=0;c--){if(kids[c].type==="tag"){out.push(kids[c]);break;}}break;}}}return __cqWrap(out);};
+                arr.filter=function(sel){var out=[];for(var a=0;a<arr.length;a++){if(typeof sel==="function"){if(sel.call(arr[a],a,arr[a]))out.push(arr[a]);}else if(__cqMatch(arr[a],sel))out.push(arr[a]);}return __cqWrap(out);};
+                arr.is=function(sel){for(var a=0;a<arr.length;a++){if(__cqMatch(arr[a],sel))return true;}return false;};
+                arr.hasClass=function(c){for(var a=0;a<arr.length;a++){var cls=" "+(arr[a].attribs?arr[a].attribs["class"]||"":"")+" ";if(cls.indexOf(" "+c+" ")>=0)return true;}return false;};
+                arr.attr=function(name,value){if(value===undefined){for(var a=0;a<arr.length;a++){var el=arr[a];if(el&&el.type==="tag"&&el.attribs){var v=el.attribs[String(name).toLowerCase()];if(v!==undefined)return v;}}return undefined;}return arr;};
                 arr.text=function(){var s="";for(var a=0;a<arr.length;a++)s+=__cqText(arr[a]);return __cqDecode(s);};
+                arr.html=function(){var s="";for(var a=0;a<arr.length;a++){var kids=arr[a].children||[];for(var b=0;b<kids.length;b++)s+=__cqHtml(kids[b]);}return s;};
                 arr.each=function(fn){for(var a=0;a<arr.length;a++)fn.call(arr[a],a,arr[a]);return arr;};
                 arr.map=function(fn){var out=[];for(var a=0;a<arr.length;a++){var r=fn.call(arr[a],a,arr[a]);if(r!=null){if(Object.prototype.toString.call(r)==="[object Array]"){for(var b=0;b<r.length;b++)out.push(r[b]);}else out.push(r);}}return __cqWrap(out);};
                 arr.toArray=function(){var c=[];for(var a=0;a<arr.length;a++)c.push(arr[a]);return c;};
                 arr.get=function(i){return i==null?arr.toArray():arr[i];};
                 arr.first=function(){return __cqWrap(arr.length?[arr[0]]:[]);};
+                arr.last=function(){return __cqWrap(arr.length?[arr[arr.length-1]]:[]);};
                 arr.eq=function(i){var n=i<0?arr.length+i:i;return __cqWrap((n>=0&&n<arr.length)?[arr[n]]:[]);};
+                arr.length=arr.length;
                 return arr;
                 }
-                function __cqLoad(html){
+                function __cqHtml(el){
+                if(!el)return "";
+                if(el.type==="text")return el.data;
+                var s="<"+el.name; for(var k in el.attribs){ if(Object.prototype.hasOwnProperty.call(el.attribs,k))s+=' '+k+'="'+String(el.attribs[k]).replace(/"/g,"&quot;")+'"'; } s+=">"; var kids=el.children||[]; for(var i=0;i<kids.length;i++)s+=__cqHtml(kids[i]); s+="</"+el.name+">"; return s;
+                }
+                function __cqLoad(html,opts){
                 var root=__cqParse(html);
                 var fn=function(sel){
-                if(typeof sel==="string"){var out=[];__cqDesc(root,sel,out);return __cqWrap(out);}
+                if(typeof sel==="string"){var out=[];__cqSelChain(root,sel,out);return __cqWrap(out);}
                 if(sel&&sel.type)return __cqWrap([sel]);
                 if(Object.prototype.toString.call(sel)==="[object Array]")return __cqWrap(sel);
                 return __cqWrap([]);
@@ -1520,7 +1765,9 @@ function getTopListDetail(topListItem) {"""
                 }
                 module.exports={load:__cqLoad};
             """.trimIndent(),
-            "@react-native-cookies/cookies" to "module.exports={get:function(){return {};},set:function(){return true;}};"
+            "@react-native-cookies/cookies" to "module.exports={get:function(){return {};},set:function(){return true;}};",
+            "webdav" to "module.exports={createClient:function(){return {getDirectoryContents:function(){return [];},getFileContents:function(){return null;},putFileContents:function(){return false;}};}};",
+            "musicfree/storage" to "module.exports={getItem:function(){return null;},setItem:function(){},removeItem:function(){}};"
         )
     }
 }
