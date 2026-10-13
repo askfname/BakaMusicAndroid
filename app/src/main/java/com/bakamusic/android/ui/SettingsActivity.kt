@@ -56,7 +56,7 @@ class SettingsActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun SettingsScreen() {
+@Composable fun SettingsScreen(embedded: Boolean = false, scrollTrigger: Int = 0) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val manager = remember { PluginManager(context.applicationContext) }
     val repository = remember { AppRepository(context.applicationContext) }
@@ -67,6 +67,9 @@ class SettingsActivity : ComponentActivity() {
     LaunchedEffect(scrollToPlugin) {
         if (scrollToPlugin) runCatching { listState.scrollToItem(PLUGIN_GROUP_INDEX) }
     }
+    LaunchedEffect(scrollTrigger) {
+        if (embedded && scrollTrigger > 0) runCatching { listState.animateScrollToItem(PLUGIN_GROUP_INDEX) }
+    }
     var plugins by remember { mutableStateOf(manager.allPlugins()) }
     var subscriptions by remember { mutableStateOf(manager.subscriptions()) }
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
@@ -75,6 +78,8 @@ class SettingsActivity : ComponentActivity() {
     var subscriptionUrl by rememberSaveable { mutableStateOf("") }
     var networkUrl by rememberSaveable { mutableStateOf("") }
     var loading by rememberSaveable { mutableStateOf(false) }
+    var confirmRemovePluginId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmDeleteSubId by rememberSaveable { mutableStateOf<String?>(null) }
     val playQuality by repository.playQuality.collectAsStateWithLifecycle(initialValue = "flac")
     val downloadQuality by repository.downloadQuality.collectAsStateWithLifecycle(initialValue = "flac")
     val refresh = { plugins = manager.allPlugins(); subscriptions = manager.subscriptions() }
@@ -114,15 +119,24 @@ class SettingsActivity : ComponentActivity() {
             notice = result.fold({ "已安装插件：${it.name} ${it.version}" }, { "安装失败：${it.message}" }); refresh()
         }
     }
-    Scaffold { padding ->
+    val doDeleteSubscription: (PluginSubscription) -> Unit = { item ->
+        manager.removeSubscription(item.id); refresh(); notice = "已删除订阅：${item.name}"
+    }
+    val doRemovePlugin: (InstalledPlugin) -> Unit = { item ->
+        manager.remove(item.id); refresh(); notice = "已卸载：${item.name}"; scope.launch {
+            runCatching { MusicSourceService.refreshAll() }
+        }
+    }
+    Scaffold(
+        contentWindowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets
+    ) { padding ->
         LazyColumn(
             state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.surface),
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 top = padding.calculateTopPadding() + 18.dp,
-                bottom = padding.calculateBottomPadding() + 24.dp
+                // 嵌入主页时底座以覆盖层悬浮，需预留空间；独立 Activity 则保持原样
+                bottom = if (embedded) 190.dp else padding.calculateBottomPadding() + 24.dp
             )
         ) {
             item {
@@ -173,19 +187,13 @@ class SettingsActivity : ComponentActivity() {
                             result.fold({ "${item.name} 更新完成，导入 ${it.installed} 个插件${it.skippedNotice()}" }, { "更新失败：${it.message ?: "未知错误"}" }); refresh()
                         }
                     },
-                    onDeleteSubscription = { item ->
-                        manager.removeSubscription(item.id); refresh(); notice = "已删除订阅：${item.name}"
-                    },
+                    onDeleteSubscription = { item -> confirmDeleteSubId = item.id },
                     onToggle = { item, enabled ->
                         manager.setEnabled(item.id, enabled); refresh(); scope.launch {
                         runCatching { MusicSourceService.refreshAll() }
                     }
                     },
-                    onRemove = { item ->
-                        manager.remove(item.id); refresh(); notice = "已卸载：${item.name}"; scope.launch {
-                        runCatching { MusicSourceService.refreshAll() }
-                    }
-                    },
+                    onRemove = { item -> confirmRemovePluginId = item.id },
                     onMove = { item, delta ->
                         manager.move(item.id, delta); refresh(); scope.launch {
                         runCatching { MusicSourceService.refreshAll() }
@@ -218,6 +226,34 @@ class SettingsActivity : ComponentActivity() {
         }, { dialog = null })
     }
     notice?.let { text -> AlertDialog(onDismissRequest = { notice = null }, title = { Text("插件管理") }, text = { Text(text) }, confirmButton = { TextButton({ notice = null }) { Text("确定") } }) }
+    confirmRemovePluginId?.let { id ->
+        val target = plugins.firstOrNull { it.id == id }
+        AlertDialog(
+            onDismissRequest = { confirmRemovePluginId = null },
+            title = { Text("卸载插件") },
+            text = { Text("确定卸载“${target?.name ?: ""}”吗？") },
+            confirmButton = {
+                TextButton(onClick = { confirmRemovePluginId = null; target?.let(doRemovePlugin) }) {
+                    Text("卸载", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmRemovePluginId = null }) { Text("取消") } }
+        )
+    }
+    confirmDeleteSubId?.let { id ->
+        val target = subscriptions.firstOrNull { it.id == id }
+        AlertDialog(
+            onDismissRequest = { confirmDeleteSubId = null },
+            title = { Text("删除订阅") },
+            text = { Text("确定删除订阅“${target?.name ?: ""}”吗？已安装的插件不受影响。") },
+            confirmButton = {
+                TextButton(onClick = { confirmDeleteSubId = null; target?.let(doDeleteSubscription) }) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteSubId = null }) { Text("取消") } }
+        )
+    }
 }
 
 @Composable private fun PluginManagementGroup(plugins: List<InstalledPlugin>, subscriptions: List<PluginSubscription>, loading: Boolean, onInstallLocal: () -> Unit, onInstallNetwork: () -> Unit, onAddSubscription: () -> Unit, onUpdate: (PluginSubscription) -> Unit, onDeleteSubscription: (PluginSubscription) -> Unit, onToggle: (InstalledPlugin, Boolean) -> Unit, onRemove: (InstalledPlugin) -> Unit, onMove: (InstalledPlugin, Int) -> Unit) {
@@ -314,11 +350,12 @@ class SettingsActivity : ComponentActivity() {
 /** 设置页 LazyColumn 中“插件管理”分组的下标：标题0/播放1/下载2/插件管理3 */
 private const val PLUGIN_GROUP_INDEX = 3
 
-/** 设置页分组卡片容器，样式跟随主题 */
+/** 设置页分组卡片容器：使用 surfaceContainerLow，深浅色跟随主题 */
 @Composable private fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
     Card(
         Modifier.padding(horizontal = 14.dp).fillMaxWidth(),
-        shape = MaterialTheme.shapes.extraLarge
+        shape = MaterialTheme.shapes.extraLarge,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
     ) { Column(content = content) }
 }
 

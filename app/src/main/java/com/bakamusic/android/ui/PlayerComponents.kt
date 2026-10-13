@@ -6,6 +6,7 @@ import com.bakamusic.android.plugin.*
 import com.bakamusic.android.util.*
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.MutableTransitionState
@@ -13,11 +14,13 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,14 +34,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -62,6 +68,217 @@ import android.os.Build
 import android.view.View
 import android.view.Window
 import android.view.WindowInsetsController
+
+@Composable fun BottomPlayerDock(
+    now: NowPlaying?, playing: Boolean, buffering: Boolean,
+    positionMs: Long, durationMs: Long,
+    onPrev: () -> Unit, onToggle: () -> Unit, onNext: () -> Unit,
+    onOpenPlayer: () -> Unit,
+    onSeek: (Long) -> Unit,
+    selectedTab: Int, onSelectTab: (Int) -> Unit
+) {
+    val enabled = now != null
+    val showLoading = now?.loading == true || buffering
+    val art = now?.item?.artwork
+    val defaultBg = MaterialTheme.colorScheme.secondaryContainer
+    val dockContext = LocalContext.current
+    // 单一 painter 同时用于封面显示与主色提取
+    val painter = rememberAsyncImagePainter(
+        model = coil.request.ImageRequest.Builder(dockContext).data(art).allowHardware(false).build()
+    )
+    val drawable = (painter.state as? AsyncImagePainter.State.Success)?.result?.drawable
+    var artworkBg by remember(art) { mutableStateOf(if (art.isNullOrBlank()) null else dockDominantCache[art]) }
+    LaunchedEffect(drawable) {
+        runCatching {
+            drawable?.let { drawableToMiniPlayerBitmap(it) }?.let { dominantColorFromMiniPlayerBitmap(it) }
+        }.getOrNull()?.let { computed ->
+            if (!art.isNullOrBlank()) dockDominantCache[art] = computed
+            artworkBg = computed
+        }
+    }
+    val targetContainer = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
+    val containerColor by animateColorAsState(targetValue = targetContainer, animationSpec = tween(600), label = "dockContainer")
+    val contentTarget = if (containerColor.luminance() > 0.6f) Color.Black else Color.White
+    val contentColor by animateColorAsState(targetValue = contentTarget, animationSpec = tween(600), label = "dockContent")
+    val subContentColor = contentColor.copy(alpha = 0.7f)
+    val buttonTint = if (enabled) contentColor else contentColor.copy(alpha = 0.38f)
+    Column(
+        modifier = Modifier.fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .padding(top = 4.dp, bottom = 8.dp)
+            .navigationBarsPadding()
+            .shadow(elevation = 8.dp, shape = RoundedCornerShape(28.dp))
+            .clip(RoundedCornerShape(28.dp))
+            .background(containerColor)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .clickable(onClick = onOpenPlayer)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(modifier = Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
+                if (now?.item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, tint = Color.White)
+                else Image(painter = painter, contentDescription = now?.item?.title, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                if (showLoading) {
+                    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                    }
+                }
+            }
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(now?.item?.title ?: "暂无播放", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = contentColor)
+                Text(
+                    now?.let { np ->
+                        "${np.item.artist} · ${formatDuration(np.item.durationMs)} · ${MusicQuality.labelOf(np.qualityKey)}${np.size?.let { " · ${formatSize(it)}" } ?: ""} · ${np.item.platform}"
+                    } ?: "点击搜索结果开始播放",
+                    fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, color = subContentColor
+                )
+            }
+            Row(modifier = Modifier.offset(x = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onPrev, enabled = enabled) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = buttonTint) }
+                IconButton(onClick = onToggle, enabled = enabled) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放暂停", tint = buttonTint) }
+                IconButton(onClick = onNext, enabled = enabled) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = buttonTint) }
+            }
+        }
+        DockSeekBar(
+            positionMs = positionMs,
+            durationMs = durationMs,
+            contentColor = contentColor,
+            onSeek = onSeek,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            DockTabItem(label = "主页", icon = Icons.Default.Home, selected = selectedTab == 0, contentColor = contentColor, onClick = { onSelectTab(0) }, modifier = Modifier.weight(1f))
+            DockTabItem(label = "音乐库", icon = Icons.Default.LibraryMusic, selected = selectedTab == 1, contentColor = contentColor, onClick = { onSelectTab(1) }, modifier = Modifier.weight(1f))
+            DockTabItem(label = "搜索", icon = Icons.Default.Search, selected = selectedTab == 2, contentColor = contentColor, onClick = { onSelectTab(2) }, modifier = Modifier.weight(1f))
+            DockTabItem(label = "设置", icon = Icons.Default.Settings, selected = selectedTab == 3, contentColor = contentColor, onClick = { onSelectTab(3) }, modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+/**
+ * 悬浮底座分隔线兼进度条
+ */
+@Composable private fun DockSeekBar(
+    positionMs: Long,
+    durationMs: Long,
+    contentColor: Color,
+    onSeek: (Long) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val enabled = durationMs > 0
+    val liveFrac = if (enabled) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+    var scrubbing by remember { mutableStateOf(false) }
+    var scrubFrac by remember { mutableFloatStateOf(0f) }
+    val shownFrac = if (scrubbing) scrubFrac else liveFrac
+    val lineH = if (scrubbing) 3.dp else 2.dp
+    BoxWithConstraints(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp).height(16.dp)
+    ) {
+        val barWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
+        val barWidthDp = maxWidth
+        Box(
+            modifier = Modifier.fillMaxSize()
+                .pointerInput(enabled, barWidthPx, durationMs) {
+                    if (!enabled) return@pointerInput
+                    detectHorizontalDragGestures(
+                        onDragStart = { offset ->
+                            scrubbing = true
+                            scrubFrac = (offset.x / barWidthPx).coerceIn(0f, 1f)
+                        },
+                        onHorizontalDrag = { change, dragAmount ->
+                            change.consume()
+                            scrubFrac = (scrubFrac + dragAmount / barWidthPx).coerceIn(0f, 1f)
+                        },
+                        onDragEnd = {
+                            scrubbing = false
+                            onSeek((scrubFrac * durationMs).toLong())
+                        },
+                        onDragCancel = { scrubbing = false }
+                    )
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                Modifier.fillMaxWidth().height(lineH)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(contentColor.copy(alpha = 0.2f))
+            )
+            Box(
+                Modifier.align(Alignment.CenterStart)
+                    .fillMaxWidth(shownFrac)
+                    .height(lineH)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(contentColor)
+            )
+            if (scrubbing) {
+                val dotD = 8.dp
+                val dotStart = (barWidthDp * shownFrac - dotD / 2).coerceIn(0.dp, barWidthDp - dotD)
+                Box(
+                    Modifier.align(Alignment.CenterStart)
+                        .padding(start = dotStart).size(dotD)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(contentColor)
+                )
+            }
+        }
+    }
+}
+
+@Composable private fun QueueModePill(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    contentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val bg = if (selected) contentColor.copy(alpha = 0.22f) else Color.Transparent
+    val tint = if (selected) contentColor else contentColor.copy(alpha = 0.75f)
+    Surface(
+        onClick = onClick,
+        modifier = modifier.height(32.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = bg,
+        border = if (selected) null else BorderStroke(1.dp, contentColor.copy(alpha = 0.35f))
+    ) {
+        Row(
+            Modifier.fillMaxHeight().padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = tint, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(label, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal, color = tint, maxLines = 1)
+        }
+    }
+}
+
+@Composable private fun DockTabItem(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    contentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val pill = if (selected) contentColor.copy(alpha = 0.22f) else Color.Transparent
+    val tint = if (selected) contentColor else contentColor.copy(alpha = 0.62f)
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(24.dp),
+        color = pill
+    ) {
+        Box(Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+            Icon(imageVector = icon, contentDescription = label, tint = tint, modifier = Modifier.size(26.dp))
+        }
+    }
+}
 
 @Composable fun MiniPlayer(
     now: NowPlaying?, playing: Boolean, buffering: Boolean,
@@ -91,7 +308,7 @@ import android.view.WindowInsetsController
     val progress = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
     Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
-            .clip(RoundedCornerShape(16.dp)).background(containerColor).clickable(onClick = onOpenPlayer)
+            .clip(RoundedCornerShape(28.dp)).background(containerColor).clickable(onClick = onOpenPlayer)
     ) {
         LinearProgressIndicator(
             progress = { progress },
@@ -125,6 +342,15 @@ import android.view.WindowInsetsController
             }
         }
     }
+}
+
+private const val DOCK_DOMINANT_CACHE_MAX = 60
+
+// 悬浮底座主色内存缓存（仅主线程读写）：底座因显隐进出 composition 时，
+// 重建可同步命中缓存，避免先回落默认色再重载的闪烁
+private val dockDominantCache = object : LinkedHashMap<String, Color>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Color>): Boolean =
+        size > DOCK_DOMINANT_CACHE_MAX
 }
 
 private fun drawableToMiniPlayerBitmap(drawable: android.graphics.drawable.Drawable): android.graphics.Bitmap? {
@@ -219,9 +445,8 @@ private fun gradientColorsFromCoverBitmap(src: android.graphics.Bitmap): Pair<Co
 }
 
 private const val COVER_GRADIENT_CACHE_MAX = 60
-
-// 封面渐变内存缓存（仅主线程读写）：播放器与全屏歌词共用同一 artwork 时直接命中。
-// lastResolvedGradient 保证切换封面时从旧色直切新色，不经过默认色。
+// 封面渐变内存缓存（仅主线程读写）：播放器与全屏歌词共用同一 artwork 时直接命中
+// lastResolvedGradient 保证切换封面时从旧色直切新色，不经过默认色
 private val coverGradientCache = object : LinkedHashMap<String, Pair<Color, Color>>(64, 0.75f, true) {
     override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Color, Color>>): Boolean =
         size > COVER_GRADIENT_CACHE_MAX
@@ -232,7 +457,7 @@ private var lastResolvedGradient: Pair<Color, Color>? = null
     val defaultStart = MaterialTheme.colorScheme.secondaryContainer
     val defaultEnd = MaterialTheme.colorScheme.surfaceContainerLow
     // 同步读缓存作为初值：命中时首帧即取色结果；
-    // 未命中则沿用上次解出的颜色，切歌时从旧色直接过渡到新色。
+    // 未命中则沿用上次解出的颜色，切歌时从旧色直接过渡到新色
     var raw by remember(artwork) {
         mutableStateOf(
             if (artwork.isNullOrBlank()) null
@@ -348,7 +573,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             onClose()
         }
     }
-    // 全屏覆盖层：画在已 edge-to-edge 的 Activity 窗口内，渐变可延伸到状态栏/导航栏下；
+    // 全屏覆盖层：画在已 edge-to-edge 的 Activity 窗口内，渐变可延伸到状态栏/导航栏下
     BackHandler { dismissAnimated() }
     Box(
         Modifier.fillMaxSize()
@@ -391,39 +616,44 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             val lyricInactive by animateColorAsState(targetValue = lyricInactiveTarget, animationSpec = tween(600), label = "coverLyricInactive")
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(gradientBrush)) {
-                Column(Modifier.fillMaxSize().padding(top = frozenStatusTop ?: 0.dp, bottom = frozenNavBottom ?: 0.dp).padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.fillMaxSize().padding(top = frozenStatusTop ?: 0.dp, bottom = frozenNavBottom ?: 0.dp).padding(top = 8.dp, bottom = 8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 24.dp)) {
                         IconButton(onClick = { dismissAnimated() }, modifier = Modifier.offset(x = (-8).dp)) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = gradientContent) }
                         Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f).offset(x = (-8).dp), fontWeight = FontWeight.Bold, color = gradientContent)
                         IconButton(onClick = onOpenDownload, enabled = now != null) { Icon(Icons.Default.Download, "下载", tint = gradientContent) }
                         IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, if (showQueue) "返回播放页" else "播放列表", tint = gradientContent) }
                     }
             if (showQueue) {
-                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = playMode == 0, onClick = { onModeChange(0) }, label = { Text("顺序") }, leadingIcon = { Icon(Icons.Default.Repeat, null, Modifier.size(16.dp)) })
-                    FilterChip(selected = playMode == 1, onClick = { onModeChange(1) }, label = { Text("单曲循环") }, leadingIcon = { Icon(Icons.Default.RepeatOne, null, Modifier.size(16.dp)) })
-                    FilterChip(selected = playMode == 2, onClick = { onModeChange(2) }, label = { Text("随机") }, leadingIcon = { Icon(Icons.Default.Shuffle, null, Modifier.size(16.dp)) })
+                Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    QueueModePill("顺序", Icons.Default.Repeat, playMode == 0, gradientContent, { onModeChange(0) })
+                    QueueModePill("单曲循环", Icons.Default.RepeatOne, playMode == 1, gradientContent, { onModeChange(1) })
+                    QueueModePill("随机", Icons.Default.Shuffle, playMode == 2, gradientContent, { onModeChange(2) })
                 }
-                LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                LazyColumn(Modifier.weight(1f)) {
                     itemsIndexed(queue) { index, item ->
                         val active = index == queueIndex
-                        ListItem(
-                            headlineContent = { Text(item.title, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal) },
-                            supportingContent = { Text("${item.artist} · ${item.platform}") },
-                            leadingContent = {
-                                Box(Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).background(if (active) MaterialTheme.colorScheme.primaryContainer else Color(0xffdbe1ff)), Alignment.Center) {
-                                    if (item.artwork.isNullOrBlank()) Icon(Icons.Default.MusicNote, null, tint = if (active) MaterialTheme.colorScheme.onPrimaryContainer else Color.White)
-                                    else AsyncImage(model = item.artwork, contentDescription = item.title, modifier = Modifier.fillMaxSize())
-                                }
-                            },
-                            trailingContent = { if (active && playing) Icon(Icons.Default.Equalizer, "播放中") },
-                            modifier = Modifier.clickable(onClick = { onPlayAt(index) })
-                        )
+                        Box(
+                            Modifier.fillMaxWidth().clickable(onClick = { onPlayAt(index) })
+                        ) {
+                            ListItem(
+                                headlineContent = { Text(item.title, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal, color = gradientContent) },
+                                supportingContent = { Text("${item.artist} · ${item.platform}", color = gradientSubContent) },
+                                leadingContent = {
+                                    Box(Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).background(if (active) MaterialTheme.colorScheme.primaryContainer else Color(0xffdbe1ff)), Alignment.Center) {
+                                        if (item.artwork.isNullOrBlank()) Icon(Icons.Default.MusicNote, null, tint = if (active) MaterialTheme.colorScheme.onPrimaryContainer else Color.White)
+                                        else AsyncImage(model = item.artwork, contentDescription = item.title, modifier = Modifier.fillMaxSize())
+                                    }
+                                },
+                                trailingContent = { if (active && playing) Icon(Icons.Default.Equalizer, "播放中", tint = gradientContent) },
+                                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                                modifier = Modifier.padding(horizontal = 16.dp)
+                            )
+                        }
                     }
                 }
             } else {
                 val item = now?.item
-                Column(Modifier.verticalScroll(rememberScrollState())) {
+                Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
                     Spacer(Modifier.height(12.dp))
                     Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(16.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
                         if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(112.dp), tint = Color.White)
@@ -669,8 +899,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable fun PlaylistSheet(
+@Composable fun PlaylistDetailScreen(
     name: String,
     songs: List<SongRecord>,
     onPlay: (SongRecord) -> Unit,
@@ -678,33 +907,167 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
     onDeletePlaylist: (() -> Unit)?,
     onClose: () -> Unit
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onClose, sheetState = sheetState) {
-        Column(Modifier.fillMaxWidth().padding(24.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(name, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                    Text("共 ${songs.size} 首", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (onDeletePlaylist != null) IconButton(onClick = onDeletePlaylist) { Icon(Icons.Default.Delete, "删除歌单") }
-                IconButton(onClick = onClose) { Icon(Icons.Default.Close, "关闭") }
+    // 全屏歌单页：自带 surface 背景盖住下方 Tab 内容；返回键关闭
+    BackHandler { onClose() }
+    var confirmDeletePlaylist by rememberSaveable { mutableStateOf(false) }
+    var pendingRemoveSong by remember { mutableStateOf<SongRecord?>(null) }
+    AnimatedVisibility(
+        visible = true,
+        enter = fadeIn(animationSpec = tween(200)) + slideInVertically(
+            initialOffsetY = { it / 4 },
+            animationSpec = tween(250)
+        )
+    ) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+            val pageBg = MaterialTheme.colorScheme.surface
+            val darkTheme = isSystemInDarkTheme()
+            val firstArtwork = songs.firstOrNull()?.artwork
+            val hasArt = !firstArtwork.isNullOrBlank()
+            // 单一 painter 兼顾显示与取色（与悬浮底座一致，保证取色真实触发）
+            val detailContext = LocalContext.current
+            val headerPainter = rememberAsyncImagePainter(
+                model = coil.request.ImageRequest.Builder(detailContext).data(firstArtwork).allowHardware(false).build()
+            )
+            val headerDrawable = (headerPainter.state as? AsyncImagePainter.State.Success)?.result?.drawable
+            var coverDominant by remember(firstArtwork) { mutableStateOf<Color?>(null) }
+            LaunchedEffect(headerDrawable) {
+                coverDominant = runCatching {
+                    headerDrawable?.let { drawableToMiniPlayerBitmap(it) }?.let { dominantColorFromMiniPlayerBitmap(it) }
+                }.getOrNull()
             }
-            Spacer(Modifier.height(8.dp))
-            if (songs.isEmpty()) {
-                Box(Modifier.fillMaxWidth().height(160.dp), Alignment.Center) { Text("歌单为空，可从搜索结果收藏或添加歌曲", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            } else {
-                LazyColumn(Modifier.heightIn(max = 440.dp)) {
-                    items(songs, key = { it.key }) { record ->
-                        ListItem(
-                            headlineContent = { Text(record.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            supportingContent = { Text("${record.artist} · ${formatDuration(record.durationMs)} · ${MusicQuality.labelOf(record.qualityKey)}${record.size?.let { " · ${formatSize(it)}" } ?: ""} · ${record.platform}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            leadingContent = { Box(Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xffdbe1ff)), Alignment.Center) { if (record.artwork.isNullOrBlank()) Icon(Icons.Default.MusicNote, null, tint = Color.White) else AsyncImage(model = record.artwork, contentDescription = record.title, modifier = Modifier.fillMaxSize()) } },
-                            trailingContent = { IconButton(onClick = { onRemove(record) }) { Icon(Icons.Default.DeleteOutline, "移出歌单") } },
-                            modifier = Modifier.clickable(onClick = { onPlay(record) })
-                        )
+            // 封面深浅自适应：浅封面用深色字/图标/按钮，深封面用白色；取色完成前先跟随主题
+            // 状态栏图标同步适配，关闭时恢复主题默认
+            val coverLight = coverDominant?.let { it.luminance() > 0.55f } ?: !darkTheme
+            PlayerSheetSystemBarsEffect(lightBackground = coverLight)
+            val headerTitleColor by animateColorAsState(
+                targetValue = if (coverLight) Color(0xFF191C1E) else Color.White,
+                animationSpec = tween(400), label = "plTitle"
+            )
+            val headerSubColor by animateColorAsState(
+                targetValue = if (coverLight) Color(0xFF191C1E).copy(alpha = 0.75f) else Color.White.copy(alpha = 0.8f),
+                animationSpec = tween(400), label = "plSub"
+            )
+            val headerIconTint by animateColorAsState(
+                targetValue = if (coverLight) Color(0xFF191C1E) else Color.White,
+                animationSpec = tween(400), label = "plIcon"
+            )
+            val headerButtonContainer by animateColorAsState(
+                targetValue = if (coverLight) Color(0xFF191C1E) else Color.White,
+                animationSpec = tween(400), label = "plBtnBg"
+            )
+            val headerButtonContent by animateColorAsState(
+                targetValue = if (coverLight) Color.White else Color(0xFF191C1E),
+                animationSpec = tween(400), label = "plBtnFg"
+            )
+            Box(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = 190.dp) // 悬浮底座预留
+                ) {
+                    item {
+                        // 沉浸大图头：封面全幅覆盖顶部并延伸至状态栏下，底部渐隐融入页面
+                        Box(Modifier.fillMaxWidth().height(360.dp)) {
+                            if (hasArt) Image(
+                                painter = headerPainter, contentDescription = "歌单封面",
+                                modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop
+                            )
+                            else Box(
+                                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerLow),
+                                contentAlignment = Alignment.Center
+                            ) { Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(72.dp)) }
+                            // 底部渐隐
+                            Box(
+                                Modifier.fillMaxSize().background(
+                                    Brush.verticalGradient(
+                                        colorStops = arrayOf(
+                                            0f to Color.Transparent,
+                                            0.55f to Color.Transparent,
+                                            1f to pageBg
+                                        )
+                                    )
+                                )
+                            )
+                            Column(
+                                Modifier.fillMaxSize().padding(22.dp),
+                                verticalArrangement = Arrangement.Bottom
+                            ) {
+                                Text(name, fontWeight = FontWeight.Bold, fontSize = 26.sp, color = headerTitleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                Spacer(Modifier.height(6.dp))
+                                Text("共 ${songs.size} 首", fontSize = 13.sp, color = headerSubColor)
+                                Spacer(Modifier.height(12.dp))
+                                Button(
+                                    onClick = { songs.firstOrNull()?.let(onPlay) },
+                                    enabled = songs.isNotEmpty(),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = headerButtonContainer,
+                                        contentColor = headerButtonContent
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 0.dp)
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("播放全部")
+                                }
+                            }
+                        }
                     }
+                    if (songs.isEmpty()) {
+                        item {
+                            Box(Modifier.fillMaxWidth().height(200.dp), Alignment.Center) {
+                                Text(
+                                    "歌单为空，可从搜索结果收藏或添加歌曲",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    } else {
+                        items(songs, key = { it.key }) { record ->
+                            ListItem(
+                                headlineContent = { Text(record.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                supportingContent = { Text("${record.artist} · ${formatDuration(record.durationMs)} · ${MusicQuality.labelOf(record.qualityKey)}${record.size?.let { " · ${formatSize(it)}" } ?: ""} · ${record.platform}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                leadingContent = { Box(Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xffdbe1ff)), Alignment.Center) { if (record.artwork.isNullOrBlank()) Icon(Icons.Default.MusicNote, null, tint = Color.White) else AsyncImage(model = record.artwork, contentDescription = record.title, modifier = Modifier.fillMaxSize()) } },
+                                trailingContent = { IconButton(onClick = { pendingRemoveSong = record }) { Icon(Icons.Default.DeleteOutline, "移出歌单") } },
+                                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                                modifier = Modifier.clickable(onClick = { onPlay(record) }).padding(horizontal = 8.dp)
+                            )
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(start = 4.dp, end = 8.dp, top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "返回", tint = headerIconTint) }
+                    Spacer(Modifier.weight(1f))
+                    if (onDeletePlaylist != null) IconButton(onClick = { confirmDeletePlaylist = true }) { Icon(Icons.Default.Delete, "删除歌单", tint = headerIconTint) }
                 }
             }
         }
+    }
+    if (confirmDeletePlaylist) {
+        AlertDialog(
+            onDismissRequest = { confirmDeletePlaylist = false },
+            title = { Text("删除歌单") },
+            text = { Text("确定删除歌单“$name”吗？其中的歌曲将被清空。") },
+            confirmButton = {
+                TextButton(onClick = { confirmDeletePlaylist = false; onDeletePlaylist?.invoke() }) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeletePlaylist = false }) { Text("取消") } }
+        )
+    }
+    pendingRemoveSong?.let { record ->
+        AlertDialog(
+            onDismissRequest = { pendingRemoveSong = null },
+            title = { Text("移出歌曲") },
+            text = { Text("确定将“${record.title}”移出歌单吗？") },
+            confirmButton = {
+                TextButton(onClick = { onRemove(record); pendingRemoveSong = null }) {
+                    Text("移出", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { pendingRemoveSong = null }) { Text("取消") } }
+        )
     }
 }

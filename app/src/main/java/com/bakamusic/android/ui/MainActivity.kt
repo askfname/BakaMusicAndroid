@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.View
 import android.view.Window
 import android.view.WindowInsets
@@ -15,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -33,13 +35,23 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -52,9 +64,13 @@ import com.bakamusic.android.service.*
 import com.bakamusic.android.plugin.*
 import com.bakamusic.android.util.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -79,6 +95,18 @@ class MainActivity : ComponentActivity() {
         ),
         content = content
     )
+}
+
+/**
+ * 常驻式 Tab 页容器：四页始终留在 composition 中，仅切换显隐
+ */
+@Composable private fun KeepAliveTab(visible: Boolean, content: @Composable () -> Unit) {
+    Box(
+        Modifier.fillMaxSize()
+            .zIndex(if (visible) 1f else 0f)
+            .alpha(if (visible) 1f else 0f)
+            .then(if (visible) Modifier else Modifier.clearAndSetSemantics {})
+    ) { content() }
 }
 
 private fun hideSystemBars(window: Window) {
@@ -118,17 +146,18 @@ private fun showSystemBars(window: Window) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun BakaApp(viewModel: MainViewModel = viewModel()) {
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    
+
     val favorites by viewModel.repository.favorites.collectAsStateWithLifecycle(initialValue = emptySet())
     val userPlaylistNames by viewModel.repository.userPlaylistNames.collectAsStateWithLifecycle(initialValue = emptyList())
-    
+
+    var selectedTab by rememberSaveable { mutableStateOf(0) }
+    var settingsScrollTrigger by remember { mutableStateOf(0) }
     var expanded by rememberSaveable { mutableStateOf(false) }
     var showQueue by rememberSaveable { mutableStateOf(false) }
     var importNotice by remember { mutableStateOf(false) }
     var playlistSheet by rememberSaveable { mutableStateOf<String?>(null) }
-    
+
     var playerAddItem by remember { mutableStateOf<MediaItem?>(null) }
     var playerDlItem by remember { mutableStateOf<MediaItem?>(null) }
     var playerQItem by remember { mutableStateOf<MediaItem?>(null) }
@@ -138,36 +167,179 @@ private fun showSystemBars(window: Window) {
         ?: remember { flowOf(emptyList<SongRecord>()) })
         .collectAsStateWithLifecycle(initialValue = emptyList())
 
-    Scaffold { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
-            Box(Modifier.weight(1f)) {
-                HomeScreen(
-                    sourceService = viewModel.sourceService,
-                    repository = viewModel.repository,
-                    favorites = favorites,
-                    playlistNames = userPlaylistNames,
-                    onPlayMedia = { item, list -> viewModel.playMediaItem(item, list) },
-                    onOpenPlaylist = { playlistSheet = it },
-                    onImportPlaylist = { importNotice = true },
-                    onSettings = { context.startActivity(Intent(context, SettingsActivity::class.java)) },
-                    onInstallPlugin = {
-                        val intent = Intent(context, SettingsActivity::class.java)
-                        intent.putExtra(SettingsActivity.EXTRA_SCROLL_TO_PLUGIN, true)
-                        context.startActivity(intent)
+    // 非首页按返回优先回到主页（播放器/全屏歌词展开时由其自身的 BackHandler 接管）
+    BackHandler(enabled = !expanded && !lyricFullscreen && selectedTab != 0) { selectedTab = 0 }
+
+    // 切页时收起键盘：隐藏页的搜索框可能仍持有焦点
+    val tabFocusManager = LocalFocusManager.current
+    LaunchedEffect(selectedTab) { tabFocusManager.clearFocus() }
+
+    // 悬浮底座显隐：位移跟随手指，用 Animatable 手动驱动位移+透明度
+    var dockGone by remember { mutableStateOf(false) }
+    var dockHPx by remember { mutableFloatStateOf(0f) }
+    val dockOffsetY = remember { Animatable(0f) }
+    val dockAlpha = remember { Animatable(1f) }
+    var dockJob by remember { mutableStateOf<Job?>(null) }
+    var dockLastTarget by remember { mutableStateOf(true) }
+    var dockRunningDur by remember { mutableIntStateOf(350) }
+    fun dockHideY(): Float = if (dockHPx > 0f) dockHPx + 64f else 800f
+    fun settleDock(show: Boolean, durMs: Int) {
+        if (show == dockLastTarget && dockJob?.isActive == true && abs(durMs - dockRunningDur) <= 60) return
+        dockLastTarget = show
+        dockRunningDur = durMs
+        dockJob?.cancel()
+        if (show) dockGone = false
+        dockJob = scope.launch {
+            coroutineScope {
+                launch { dockOffsetY.animateTo(if (show) 0f else dockHideY(), tween(durMs)) }
+                launch { dockAlpha.animateTo(if (show) 1f else 0f, tween(durMs)) }
+            }
+            if (!show) dockGone = true
+        }
+    }
+    fun durationForDist(dPx: Float): Int =
+        (90_000f / dPx.coerceAtLeast(96f)).toInt().coerceIn(280, 650)
+    val dockHideConnection = remember {
+        object : NestedScrollConnection {
+            var acc = 0f
+            var lastT = 0L
+            var wasted = 0f
+            // 页面无法滚动时的安全网：滑动完全不被消费
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val dy = available.y
+                if (dy != 0f) {
+                    if (wasted != 0f && (wasted < 0f) != (dy < 0f)) wasted = 0f
+                    wasted += dy
+                    if (abs(wasted) > 120f) {
+                        wasted = 0f
+                        settleDock(true, 400)
                     }
+                }
+                return Offset.Zero
+            }
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                val dy = consumed.y
+                if (dy != 0f) {
+                    wasted = 0f
+                    val now = SystemClock.uptimeMillis()
+                    // 新手势（与上次事件间隔过久）与变向都清零累计
+                    if (now - lastT > 250L || (acc != 0f && (acc < 0f) != (dy < 0f))) acc = 0f
+                    acc += dy
+                    lastT = now
+                    // 96px（约 36dp）内短距离滑动不触发；内容上滑（acc<0）隐藏，下滑显示
+                    if (abs(acc) > 96f) {
+                        val show = acc > 0f
+                        settleDock(show, durationForDist(abs(acc)))
+                    }
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                val v = consumed.y
+                // 轻 flick 或本手势累计位移不足不触发；
+                if (abs(v) > 2000f && abs(acc) > 200f) {
+                    val show = v > 0f
+                    settleDock(show, durationForDist(maxOf(abs(acc), abs(v) * 0.3f)))
+                }
+                return Velocity.Zero
+            }
+        }
+    }
+    // 从任意歌曲列表选中并播放新歌曲时，确保底座可见
+    LaunchedEffect(viewModel.nowPlaying?.key) { settleDock(true, 350) }
+    // 切页即显示底座：新页可能不可滚动，避免隐藏态下无处可滑导致导航丢失
+    LaunchedEffect(selectedTab) { settleDock(true, 350) }
+
+    fun jumpToPluginSettings() {
+        selectedTab = 3
+        settingsScrollTrigger++
+        playlistSheet = null
+    }
+
+    Scaffold { padding ->
+        // 底座不再占用 bottomBar 槽位，而是以覆盖层形态悬浮于内容之上
+        Box(Modifier.fillMaxSize().nestedScroll(dockHideConnection)) {
+            Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+            Box(Modifier.fillMaxSize()) {
+                KeepAliveTab(visible = selectedTab == 0) {
+                    HomeTab(
+                        sourceService = viewModel.sourceService,
+                        repository = viewModel.repository,
+                        favorites = favorites,
+                        playlistNames = userPlaylistNames,
+                        onPlayMedia = { item, list -> viewModel.playMediaItem(item, list) },
+                        onInstallPlugin = { jumpToPluginSettings() }
+                    )
+                }
+                KeepAliveTab(visible = selectedTab == 1) {
+                    LibraryTab(
+                        repository = viewModel.repository,
+                        playlistNames = userPlaylistNames,
+                        onOpenPlaylist = { playlistSheet = it },
+                        onImportPlaylist = { importNotice = true }
+                    )
+                }
+                KeepAliveTab(visible = selectedTab == 2) {
+                    SearchTab(
+                        sourceService = viewModel.sourceService,
+                        repository = viewModel.repository,
+                        favorites = favorites,
+                        playlistNames = userPlaylistNames,
+                        onPlayMedia = { item, list -> viewModel.playMediaItem(item, list) },
+                        onInstallPlugin = { jumpToPluginSettings() },
+                        onShowDock = { settleDock(true, 350) }
+                    )
+                }
+                KeepAliveTab(visible = selectedTab == 3) {
+                    SettingsScreen(embedded = true, scrollTrigger = settingsScrollTrigger)
+                }
+            }
+            }
+            // 歌单详情全屏页：盖在内容层之上、悬浮底座之下，底座始终全局可见不被覆盖
+            playlistSheet?.let { name ->
+                PlaylistDetailScreen(
+                    name = name,
+                    songs = sheetSongs,
+                    onPlay = { record ->
+                        val items = sheetSongs.map { it.toMediaItem() }
+                        val idx = items.indexOfFirst { it.platform == record.platform && it.id == record.id }
+                        if (idx >= 0) viewModel.playItems(items, idx) else viewModel.playMediaItem(record.toMediaItem(), emptyList())
+                    },
+                    onRemove = { record -> scope.launch(Dispatchers.IO) { viewModel.repository.removeFromPlaylist(name, record.key) } },
+                    onDeletePlaylist = if (name == AppRepository.FAVORITE_SHEET) null else ({
+                        scope.launch(Dispatchers.IO) { viewModel.repository.deletePlaylist(name) }
+                        playlistSheet = null
+                        settleDock(true, 350)
+                    }),
+                    onClose = { playlistSheet = null; settleDock(true, 350) }
                 )
             }
-            MiniPlayer(
-                now = viewModel.nowPlaying,
-                playing = viewModel.playing,
-                buffering = viewModel.buffering,
-                positionMs = viewModel.positionMs,
-                durationMs = viewModel.durationMs,
-                onPrev = { viewModel.stepPrev() },
-                onToggle = { viewModel.togglePlay() },
-                onNext = { viewModel.stepNext() },
-                onOpenPlayer = { showQueue = false; expanded = true }
-            )
+            // 底座常驻 composition（显隐只做位移+透明度，不移除）
+            if (!dockGone) {
+                Box(
+                    Modifier.align(Alignment.BottomCenter)
+                        .onSizeChanged { dockHPx = it.height.toFloat() }
+                        .offset { IntOffset(0, dockOffsetY.value.roundToInt()) }
+                        .alpha(dockAlpha.value)
+                ) {
+                BottomPlayerDock(
+                    now = viewModel.nowPlaying,
+                    playing = viewModel.playing,
+                    buffering = viewModel.buffering,
+                    positionMs = viewModel.positionMs,
+                    durationMs = viewModel.durationMs,
+                    onPrev = { viewModel.stepPrev() },
+                    onToggle = { viewModel.togglePlay() },
+                    onNext = { viewModel.stepNext() },
+                    onOpenPlayer = { showQueue = false; expanded = true },
+                    onSeek = { viewModel.seekTo(it) },
+                    selectedTab = selectedTab,
+                    // 切页即关闭歌单详情，避免其盖住其他页面
+                    onSelectTab = { selectedTab = it; playlistSheet = null }
+                )
+                }
+            }
         }
     }
 
@@ -437,22 +609,4 @@ private fun showSystemBars(window: Window) {
         )
     }
 
-    playlistSheet?.let { name ->
-        PlaylistSheet(
-            name = name,
-            songs = sheetSongs,
-            onPlay = { record ->
-                val items = sheetSongs.map { it.toMediaItem() }
-                val idx = items.indexOfFirst { it.platform == record.platform && it.id == record.id }
-                playlistSheet = null
-                if (idx >= 0) viewModel.playItems(items, idx) else viewModel.playMediaItem(record.toMediaItem(), emptyList())
-            },
-            onRemove = { record -> scope.launch(Dispatchers.IO) { viewModel.repository.removeFromPlaylist(name, record.key) } },
-            onDeletePlaylist = if (name == AppRepository.FAVORITE_SHEET) null else ({
-                scope.launch(Dispatchers.IO) { viewModel.repository.deletePlaylist(name) }
-                playlistSheet = null
-            }),
-            onClose = { playlistSheet = null }
-        )
-    }
 }

@@ -153,6 +153,10 @@ class AppRepository(private val context: Context) {
 
     suspend fun addSearch(query: String) { if (query.isBlank()) return; context.appDataStore.edit { it[historyKey] = encode((decode(it[historyKey]) - query).toMutableList().apply { add(0, query) }.take(20)) } }
 
+    suspend fun removeSearch(query: String) { context.appDataStore.edit { it[historyKey] = encode(decode(it[historyKey]) - query) } }
+
+    suspend fun clearSearchHistory() { context.appDataStore.edit { it[historyKey] = encode(emptyList()) } }
+
     /**
      * 收藏切换：收藏时写入快照，取消时仅移除键（快照保留供歌单使用）。
      * 返回切换后是否为已收藏。
