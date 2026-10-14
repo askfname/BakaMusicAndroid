@@ -316,6 +316,8 @@ private fun showSystemBars(window: Window) {
                 )
             }
             // 底座常驻 composition（显隐只做位移+透明度，不移除）
+            // DockHost 在内部订阅 positionMs/durationMs
+            // 全屏播放器/全屏歌词盖住底座时冻结进度订阅（传 0 哨兵并停止读取 State）
             if (!dockGone) {
                 Box(
                     Modifier.align(Alignment.BottomCenter)
@@ -323,20 +325,12 @@ private fun showSystemBars(window: Window) {
                         .offset { IntOffset(0, dockOffsetY.value.roundToInt()) }
                         .alpha(dockAlpha.value)
                 ) {
-                BottomPlayerDock(
-                    now = viewModel.nowPlaying,
-                    playing = viewModel.playing,
-                    buffering = viewModel.buffering,
-                    positionMs = viewModel.positionMs,
-                    durationMs = viewModel.durationMs,
-                    onPrev = { viewModel.stepPrev() },
-                    onToggle = { viewModel.togglePlay() },
-                    onNext = { viewModel.stepNext() },
-                    onOpenPlayer = { showQueue = false; expanded = true },
-                    onSeek = { viewModel.seekTo(it) },
+                DockHost(
+                    viewModel = viewModel,
                     selectedTab = selectedTab,
-                    // 切页即关闭歌单详情，避免其盖住其他页面
-                    onSelectTab = { selectedTab = it; playlistSheet = null }
+                    onSelectTab = { selectedTab = it; playlistSheet = null },
+                    onOpenPlayer = { showQueue = false; expanded = true },
+                    progressActive = !expanded && !lyricFullscreen
                 )
                 }
             }
@@ -400,31 +394,16 @@ private fun showSystemBars(window: Window) {
         )
     }
 
-    if (expanded) PlayerSheet(
-        now = viewModel.nowPlaying,
-        playing = viewModel.playing,
-        queue = viewModel.playQueue.toList(),
-        queueIndex = viewModel.queueIndex,
-        positionMs = viewModel.positionMs,
-        durationMs = viewModel.durationMs,
-        lyricLines = viewModel.lyricLines,
-        lyricLoading = viewModel.lyricLoading,
-        onToggle = { viewModel.togglePlay() },
-        onPrev = { viewModel.stepPrev() },
-        onNext = { viewModel.stepNext() },
-        onSeek = { pos -> viewModel.seekTo(pos) },
-        onPlayAt = { viewModel.playAt(it) },
-        isFavorite = viewModel.nowPlaying?.let { favorites.contains(it.key) } == true,
-        onToggleFavorite = { viewModel.nowPlaying?.let { scope.launch(Dispatchers.IO) { viewModel.repository.toggleFavorite(it.item) } } },
+    if (expanded) PlayerSheetHost(
+        viewModel = viewModel,
+        favorites = favorites,
+        showQueue = showQueue,
+        onToggleQueue = { showQueue = !showQueue },
+        onClose = { expanded = false; showQueue = false },
         onOpenAddPlaylist = { playerAddItem = viewModel.nowPlaying?.item },
         onOpenDownload = { playerDlItem = viewModel.nowPlaying?.item },
         onOpenSwitchQuality = { playerQItem = viewModel.nowPlaying?.item },
-        buffering = viewModel.buffering,
-        onClose = { expanded = false; showQueue = false },
-        showQueue = showQueue,
-        onToggleQueue = { showQueue = !showQueue },
-        playMode = viewModel.playMode,
-        onModeChange = { viewModel.playMode = it },
+        onToggleFavorite = { viewModel.nowPlaying?.let { scope.launch(Dispatchers.IO) { viewModel.repository.toggleFavorite(it.item) } } },
         onOpenLyricFullscreen = { lyricFullscreen = true }
     )
 
@@ -514,18 +493,10 @@ private fun showSystemBars(window: Window) {
                     }
                     Spacer(Modifier.height(8.dp))
                     Box(Modifier.fillMaxWidth().weight(1f)) {
-                        LyricsView(
-                            lines = viewModel.lyricLines,
-                            positionMs = viewModel.positionMs,
-                            loading = viewModel.lyricLoading && viewModel.nowPlaying != null,
-                            playing = viewModel.playing,
-                            markerFraction = 0.24f,
-                            fontScale = 1.35f,
-                            centered = true,
+                        FullscreenLyricBody(
+                            viewModel = viewModel,
                             activeColor = lyricContent,
-                            inactiveColor = lyricInactive,
-                            onSeek = { viewModel.seekTo(it) },
-                            lineGap = 10.dp
+                            inactiveColor = lyricInactive
                         )
                     }
                 }
@@ -609,4 +580,104 @@ private fun showSystemBars(window: Window) {
         )
     }
 
+}
+
+/**
+ * 进度态重组隔离 Host：高频的 positionMs/durationMs 只在这些小子树内订阅
+ */
+@Composable private fun DockHost(
+    viewModel: MainViewModel,
+    selectedTab: Int,
+    onSelectTab: (Int) -> Unit,
+    onOpenPlayer: () -> Unit,
+    progressActive: Boolean
+) {
+    // 被全屏覆盖时不读取 positionMs/durationMs State：无订阅即无重组；
+    // 哨兵 0 仅影响被遮挡的进度条，恢复显示时下一 tick 即回 live 值
+    val positionMs = if (progressActive) viewModel.positionMs else 0L
+    val durationMs = if (progressActive) viewModel.durationMs else 0L
+    BottomPlayerDock(
+        now = viewModel.nowPlaying,
+        playing = viewModel.playing,
+        buffering = viewModel.buffering,
+        positionMs = positionMs,
+        durationMs = durationMs,
+        onPrev = { viewModel.stepPrev() },
+        onToggle = { viewModel.togglePlay() },
+        onNext = { viewModel.stepNext() },
+        onOpenPlayer = onOpenPlayer,
+        onSeek = { viewModel.seekTo(it) },
+        selectedTab = selectedTab,
+        onSelectTab = onSelectTab
+    )
+}
+
+@Composable private fun PlayerSheetHost(
+    viewModel: MainViewModel,
+    favorites: Set<String>,
+    showQueue: Boolean,
+    onToggleQueue: () -> Unit,
+    onClose: () -> Unit,
+    onOpenAddPlaylist: () -> Unit,
+    onOpenDownload: () -> Unit,
+    onOpenSwitchQuality: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    onOpenLyricFullscreen: () -> Unit
+) {
+    // 回调全部 remember：实例跨 4Hz 进度 tick 稳定，PlayerSheet 内静态子树得以 skip；
+    // 若每次传新 lambda，静态子树参数恒不等、拆分即失效
+    val onToggle = remember(viewModel) { { viewModel.togglePlay() } }
+    val onPrev = remember(viewModel) { { viewModel.stepPrev() } }
+    val onNext = remember(viewModel) { { viewModel.stepNext() } }
+    val onSeek = remember(viewModel) { { pos: Long -> viewModel.seekTo(pos) } }
+    val onPlayAt = remember(viewModel) { { index: Int -> viewModel.playAt(index) } }
+    val onModeChange = remember(viewModel) { { mode: Int -> viewModel.playMode = mode } }
+    PlayerSheet(
+        now = viewModel.nowPlaying,
+        playing = viewModel.playing,
+        // 传 SnapshotStateList 本体（同实例）：内容不变时参数 equal 可 skip
+        queue = viewModel.playQueue,
+        queueIndex = viewModel.queueIndex,
+        positionMs = viewModel.positionMs,
+        durationMs = viewModel.durationMs,
+        lyricLines = viewModel.lyricLines,
+        lyricLoading = viewModel.lyricLoading,
+        onToggle = onToggle,
+        onPrev = onPrev,
+        onNext = onNext,
+        onSeek = onSeek,
+        onPlayAt = onPlayAt,
+        isFavorite = viewModel.nowPlaying?.let { favorites.contains(it.key) } == true,
+        onToggleFavorite = onToggleFavorite,
+        onOpenAddPlaylist = onOpenAddPlaylist,
+        onOpenDownload = onOpenDownload,
+        onOpenSwitchQuality = onOpenSwitchQuality,
+        buffering = viewModel.buffering,
+        onClose = onClose,
+        showQueue = showQueue,
+        onToggleQueue = onToggleQueue,
+        playMode = viewModel.playMode,
+        onModeChange = onModeChange,
+        onOpenLyricFullscreen = onOpenLyricFullscreen
+    )
+}
+
+@Composable private fun FullscreenLyricBody(
+    viewModel: MainViewModel,
+    activeColor: Color,
+    inactiveColor: Color
+) {
+    LyricsView(
+        lines = viewModel.lyricLines,
+        positionMs = viewModel.positionMs,
+        loading = viewModel.lyricLoading && viewModel.nowPlaying != null,
+        playing = viewModel.playing,
+        markerFraction = 0.24f,
+        fontScale = 1.35f,
+        centered = true,
+        activeColor = activeColor,
+        inactiveColor = inactiveColor,
+        onSeek = { viewModel.seekTo(it) },
+        lineGap = 10.dp
+    )
 }

@@ -66,9 +66,26 @@ class PlaybackController(context: Context) {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) audibleListeners.forEach { runCatching { it() } }
         }
+
+        /**
+         * 播放完毕事件驱动：切歌不再依赖轮询，即使后台低频轮询也能及时进下一首
+         * 这是后台省电的前提。轮询侧保留 ended 兜底（有去重 guard）
+         */
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == androidx.media3.common.Player.STATE_ENDED) {
+                endedListeners.forEach { runCatching { it() } }
+            }
+        }
     }
 
     private val audibleListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+    private val endedListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /** 订阅播放完毕事件，返回取消订阅函数 */
+    fun addEndedListener(listener: () -> Unit): () -> Unit {
+        endedListeners.add(listener)
+        return { endedListeners.remove(listener) }
+    }
 
     /** 订阅进入播放状态事件，返回取消订阅函数 */
     fun addAudibleListener(listener: () -> Unit): () -> Unit {

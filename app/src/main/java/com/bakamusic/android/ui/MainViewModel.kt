@@ -15,6 +15,7 @@ import com.bakamusic.android.service.*
 import com.bakamusic.android.plugin.*
 import com.bakamusic.android.util.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -115,13 +116,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         playbackController.addAudibleListener {
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
         }
+        // 播放完毕事件驱动切歌（主线程回调）：后台低频轮询下也能及时进下一首
+        playbackController.addEndedListener { handleTrackEnded() }
+
+        // 回到前台立刻刷新一次快照：后台期间 position/duration 被冻结
+        viewModelScope.launch {
+            bakaApp.foreground.collect { fg ->
+                if (fg) {
+                    val s = runCatching { playbackController.snapshot() }.getOrNull()
+                    if (s != null) {
+                        playing = s.isPlaying
+                        buffering = s.buffering
+                        serviceItemCount = s.itemCount
+                        if (s.itemCount > 0) positionMs = s.positionMs
+                        if (s.durationMs > 0) durationMs = s.durationMs
+                        if (s.ended) handleTrackEnded()
+                    }
+                }
+            }
+        }
 
         viewModelScope.launch {
-            var pollTick = 0
+            var lastPosSaveMs = 0L
             while (true) {
-                delay(50)
+                // 三档轮询：前台播放中 250ms（进度条/歌词），前台暂停/空闲 1000ms，
+                // 后台 4000ms 且不写任何 Compose State（无订阅即无重组，后台零 UI 开销）
+                // 后台切歌由 ended 事件驱动，无需轮询兜底
+                val fg = bakaApp.foreground.value
+                val active = nowPlaying != null && (playing || buffering)
+                delay(if (!fg) 4000 else if (active) 250 else 1000)
                 val s = runCatching { playbackController.snapshot() }.getOrNull() ?: continue
+                // playing/buffering/itemCount 同值写入不触发重组，后台也可更新，保证返回时状态新鲜
                 playing = s.isPlaying
+                buffering = s.buffering
+                serviceItemCount = s.itemCount
+                if (!fg) {
+                    // 后台：只做会话进度落盘（SharedPreferences，非 State）
+                    if (nowPlaying != null && s.isPlaying) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastPosSaveMs > 10_000) {
+                            lastPosSaveMs = now
+                            val pos = s.positionMs
+                            viewModelScope.launch(Dispatchers.IO) { sessionStore.savePosition(pos) }
+                        }
+                    }
+                    if (s.ended) handleTrackEnded()
+                    continue
+                }
                 val hold = holdPositionMs
                 if (hold != null && s.itemCount > 0) {
                     // 切音质保持中：收敛到保持点附近或超时才解除，其余时间不跟随新流的归零位置
@@ -135,9 +176,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 buffering = s.buffering
                 serviceItemCount = s.itemCount
                 if (s.durationMs > 0) durationMs = s.durationMs
-                
-                if (nowPlaying != null && ++pollTick % 100 == 0) {
-                    sessionStore.savePosition(positionMs)
+
+                // 进度落盘改为时间节流（10s 且播放中）
+                if (nowPlaying != null && s.isPlaying) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastPosSaveMs > 10_000) {
+                        lastPosSaveMs = now
+                        val pos = positionMs
+                        viewModelScope.launch(Dispatchers.IO) { sessionStore.savePosition(pos) }
+                    }
                 }
 
                 if (s.ended) {
@@ -167,11 +214,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         
-        // 定期保存播放会话
-        viewModelScope.launch {
+        // 定期保存播放会话：脏检查 + 15s 间隔 + IO 线程
+        viewModelScope.launch(Dispatchers.IO) {
+            var lastSig = ""
             while(true) {
-                delay(2000)
-                sessionStore.save(playQueue.toList(), queueIndex, nowPlaying?.item, nowPlaying?.qualityKey, nowPlaying?.size, positionMs)
+                delay(15_000)
+                val np = nowPlaying
+                val q = playQueue.toList()
+                // 位置按 10s 桶参与签名，避免纯进度推进导致每轮都判脏
+                val posBucket = positionMs / 10_000
+                val sig = "${np?.key}@${np?.qualityKey}@$queueIndex@${q.size}@${q.firstOrNull()?.id}@${q.lastOrNull()?.id}@$posBucket"
+                if (sig == lastSig) continue
+                lastSig = sig
+                runCatching {
+                    sessionStore.save(q, queueIndex, np?.item, np?.qualityKey, np?.size, positionMs)
+                }
             }
         }
     }

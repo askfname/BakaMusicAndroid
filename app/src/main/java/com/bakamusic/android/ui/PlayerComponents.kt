@@ -89,12 +89,15 @@ import android.view.WindowInsetsController
     val drawable = (painter.state as? AsyncImagePainter.State.Success)?.result?.drawable
     var artworkBg by remember(art) { mutableStateOf(if (art.isNullOrBlank()) null else dockDominantCache[art]) }
     LaunchedEffect(drawable) {
-        runCatching {
-            drawable?.let { drawableToMiniPlayerBitmap(it) }?.let { dominantColorFromMiniPlayerBitmap(it) }
-        }.getOrNull()?.let { computed ->
-            if (!art.isNullOrBlank()) dockDominantCache[art] = computed
-            artworkBg = computed
-        }
+        val d = drawable ?: return@LaunchedEffect
+        // 位图取色放 Default 线程
+        val computed = withContext(Dispatchers.Default) {
+            runCatching {
+                drawableToMiniPlayerBitmap(d)?.let { dominantColorFromMiniPlayerBitmap(it) }
+            }.getOrNull()
+        } ?: return@LaunchedEffect
+        if (!art.isNullOrBlank()) dockDominantCache[art] = computed
+        artworkBg = computed
     }
     val targetContainer = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
     val containerColor by animateColorAsState(targetValue = targetContainer, animationSpec = tween(600), label = "dockContainer")
@@ -297,9 +300,12 @@ import android.view.WindowInsetsController
     )
     val drawable = (painter.state as? AsyncImagePainter.State.Success)?.result?.drawable
     LaunchedEffect(drawable) {
-        artworkBg = runCatching {
-            drawable?.let { drawableToMiniPlayerBitmap(it) }?.let { dominantColorFromMiniPlayerBitmap(it) }
-        }.getOrNull()
+        val d = drawable ?: return@LaunchedEffect
+        artworkBg = withContext(Dispatchers.Default) {
+            runCatching {
+                drawableToMiniPlayerBitmap(d)?.let { dominantColorFromMiniPlayerBitmap(it) }
+            }.getOrNull()
+        }
     }
     val containerColor = if (art.isNullOrBlank()) defaultBg else artworkBg ?: defaultBg
     val contentColor = if (containerColor.luminance() > 0.6f) Color.Black else Color.White
@@ -482,9 +488,12 @@ private var lastResolvedGradient: Pair<Color, Color>? = null
                 val request = coil.request.ImageRequest.Builder(context)
                     .data(artwork)
                     .allowHardware(false)
+                    // 取色仅需 96px 缩略图，避免解码整图
+                    .size(96)
                     .build()
                 val result = context.imageLoader.execute(request)
                 val drawable = (result as? coil.request.SuccessResult)?.drawable ?: return@runCatching null
+                // drawableToMini/gradient 内含的 copy/scale/recycle 均为小图操作，IO 线程可直接执行
                 drawableToMiniPlayerBitmap(drawable)?.let { gradientColorsFromCoverBitmap(it) }
             }.getOrNull()
         }
@@ -617,12 +626,17 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             Surface(Modifier.fillMaxSize(), color = Color.Transparent) {
                 Box(Modifier.fillMaxSize().background(gradientBrush)) {
                 Column(Modifier.fillMaxSize().padding(top = frozenStatusTop ?: 0.dp, bottom = frozenNavBottom ?: 0.dp).padding(top = 8.dp, bottom = 8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 24.dp)) {
-                        IconButton(onClick = { dismissAnimated() }, modifier = Modifier.offset(x = (-8).dp)) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = gradientContent) }
-                        Text(if (showQueue) "播放列表" else "正在播放", Modifier.weight(1f).offset(x = (-8).dp), fontWeight = FontWeight.Bold, color = gradientContent)
-                        IconButton(onClick = onOpenDownload, enabled = now != null) { Icon(Icons.Default.Download, "下载", tint = gradientContent) }
-                        IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, if (showQueue) "返回播放页" else "播放列表", tint = gradientContent) }
-                    }
+                    // dismiss 引用 remembered transition，实例跨重组稳定，Header 得以在进度 tick 时 skip
+                    val dismissStable = remember(transition) { { dismissAnimated() } }
+                    PlayerSheetHeader(
+                        title = if (showQueue) "播放列表" else "正在播放",
+                        contentColor = gradientContent,
+                        downloadEnabled = now != null,
+                        queueLabel = if (showQueue) "返回播放页" else "播放列表",
+                        onDismiss = dismissStable,
+                        onOpenDownload = onOpenDownload,
+                        onToggleQueue = onToggleQueue
+                    )
             if (showQueue) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QueueModePill("顺序", Icons.Default.Repeat, playMode == 0, gradientContent, { onModeChange(0) })
@@ -630,7 +644,8 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                     QueueModePill("随机", Icons.Default.Shuffle, playMode == 2, gradientContent, { onModeChange(2) })
                 }
                 LazyColumn(Modifier.weight(1f)) {
-                    itemsIndexed(queue) { index, item ->
+                    // key 显式化：队列不变时整表 skip，不随 4Hz 进度 tick 重排
+                    itemsIndexed(queue, key = { index, item -> "${item.platform}:${item.id}:$index" }) { index, item ->
                         val active = index == queueIndex
                         Box(
                             Modifier.fillMaxWidth().clickable(onClick = { onPlayAt(index) })
@@ -652,109 +667,42 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                     }
                 }
             } else {
-                val item = now?.item
-                Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
-                    Spacer(Modifier.height(12.dp))
-                    Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(16.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
-                        if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(112.dp), tint = Color.White)
-                        else AsyncImage(model = item?.artwork, contentDescription = item?.title, modifier = Modifier.fillMaxSize())
-                    }
-                    Spacer(Modifier.height(24.dp))
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        Column(Modifier.weight(1f)) {
-                            Text(item?.title ?: "暂无播放", fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = gradientContent)
-                            Text(item?.artist ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis, color = gradientContent)
-                            Text(
-                                if (now != null) "${formatDuration(item?.durationMs ?: 0)} · ${MusicQuality.labelOf(now.qualityKey)}${now.size?.let { " · ${formatSize(it)}" } ?: ""} · ${item?.platform}"
-                                else "从搜索或歌单中选择歌曲播放",
-                                fontSize = 12.sp, color = gradientSubContent
-                            )
-                        }
-                        IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(x = 8.dp, y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质", tint = gradientContent) }
-                    }
-                    var seeking by remember(now?.key) { mutableStateOf(false) }
-                    var seekFrac by remember(now?.key) { mutableStateOf(0f) }
-                    var seekTarget by remember(now?.key) { mutableStateOf<Long?>(null) }
-                    LaunchedEffect(positionMs) {
-                        seekTarget?.let { if (kotlin.math.abs(positionMs - it) < 1500) seekTarget = null }
-                    }
-                    LaunchedEffect(seekTarget) {
-                        if (seekTarget != null) { delay(5000); seekTarget = null }
-                    }
-                    val shownPosMs = when {
-                        seeking && durationMs > 0 -> (seekFrac * durationMs).toLong()
-                        seekTarget != null && durationMs > 0 -> seekTarget!!
-                        else -> positionMs
-                    }
-                    val shownFrac = if (durationMs > 0) (shownPosMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
-                    val sliderFrac = if (seeking) seekFrac else shownFrac
-                    val progressActive = if (durationMs > 0) gradientContent.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                    val progressInactive = if (durationMs > 0) gradientContent.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                    val dotColor = if (durationMs > 0) gradientContent else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                    Slider(
-                        value = if (seeking) seekFrac else shownFrac,
-                        onValueChange = { seeking = true; seekFrac = it },
-                        onValueChangeFinished = {
-                            seeking = false
-                            if (durationMs > 0) {
-                                val target = (seekFrac * durationMs).toLong()
-                                seekTarget = target
-                                onSeek(target)
-                            }
-                        },
-                        enabled = durationMs > 0,
-                        track = {
-                        BoxWithConstraints(Modifier.fillMaxWidth().height(16.dp)) {
-                            val lineWidth = maxWidth
-                            val frac = sliderFrac.coerceIn(0f, 1f)
-                            Row(
-                                Modifier.align(Alignment.CenterStart).fillMaxWidth().height(16.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    Modifier.width(lineWidth * frac).height(5.dp)
-                                        .clip(androidx.compose.foundation.shape.CircleShape).background(progressActive)
-                                )
-                                Box(
-                                    Modifier.weight(1f).height(3.dp)
-                                        .clip(androidx.compose.foundation.shape.CircleShape).background(progressInactive)
-                                )
-                            }
-                            val dotSize = 10.dp
-                            val dotOffset = (lineWidth * frac - dotSize / 2).coerceIn(0.dp, lineWidth - dotSize)
-                            Box(
-                                Modifier.align(Alignment.CenterStart).padding(start = dotOffset).size(dotSize)
-                                    .clip(androidx.compose.foundation.shape.CircleShape).background(dotColor)
-                            )
-                        }
-                    },
-                        thumb = { }
-                    )
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(formatDuration(shownPosMs), fontSize = 12.sp, color = gradientSubContent)
-                        Spacer(Modifier.weight(1f))
-                        Text(formatDuration(durationMs), fontSize = 12.sp, color = gradientSubContent)
-                    }
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onToggleFavorite, enabled = now != null) { Icon(imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = "收藏", tint = gradientContent) }
-                        IconButton(onClick = onPrev, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = gradientContent, modifier = Modifier.size(36.dp)) }
-                        if ((now?.loading == true || buffering) && now != null) {
-                            Box(Modifier.size(64.dp), Alignment.Center) {
-                                CircularProgressIndicator(Modifier.size(48.dp), color = gradientContent, strokeWidth = 3.dp)
-                            }
-                        } else {
-                            IconButton(onClick = onToggle, modifier = Modifier.size(64.dp), enabled = now != null) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放", tint = gradientContent, modifier = Modifier.size(54.dp)) }
-                        }
-                        IconButton(onClick = onNext, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = gradientContent, modifier = Modifier.size(36.dp)) }
-                        IconButton(onClick = onOpenAddPlaylist, enabled = now != null) { Icon(imageVector = Icons.Default.PlaylistAdd, contentDescription = "加歌单", tint = gradientContent) }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
-                        Text("歌词", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), color = gradientContent)
-                        IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp), tint = gradientContent) }
-                    }
-                    Box(Modifier.fillMaxWidth().height(220.dp)) {
-                        LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, playing = playing, centered = true, activeColor = gradientContent, inactiveColor = lyricInactive, onSeek = onSeek, showLoadingSpinner = false)
-                    }
+                // 静态区（封面/控制/歌词头）：参数全稳定，进度 tick 时整棵 skip；
+                // 动态区只有 SeekZone（4Hz）与 LyricsView（100~400ms ticker）
+                PlayerSheetCover(
+                    now = now,
+                    contentColor = gradientContent,
+                    subContentColor = gradientSubContent,
+                    onOpenSwitchQuality = onOpenSwitchQuality
+                )
+                PlayerSeekZone(
+                    trackKey = now?.key,
+                    positionMs = positionMs,
+                    durationMs = durationMs,
+                    timeColor = gradientSubContent,
+                    progressActive = if (durationMs > 0) gradientContent.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                    progressInactive = if (durationMs > 0) gradientContent.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                    dotColor = if (durationMs > 0) gradientContent else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                    onSeek = onSeek
+                )
+                PlayerSheetControls(
+                    now = now,
+                    playing = playing,
+                    buffering = buffering,
+                    isFavorite = isFavorite,
+                    contentColor = gradientContent,
+                    onToggleFavorite = onToggleFavorite,
+                    onPrev = onPrev,
+                    onToggle = onToggle,
+                    onNext = onNext,
+                    onOpenAddPlaylist = onOpenAddPlaylist
+                )
+                PlayerLyricHeader(
+                    contentColor = gradientContent,
+                    onOpenLyricFullscreen = onOpenLyricFullscreen
+                )
+                Box(Modifier.fillMaxWidth().height(220.dp).padding(horizontal = 24.dp)) {
+                    LyricsView(lines = lyricLines, positionMs = positionMs, loading = lyricLoading && now != null, playing = playing, centered = true, activeColor = gradientContent, inactiveColor = lyricInactive, onSeek = onSeek, showLoadingSpinner = false)
                 }
             }
                 }
@@ -762,6 +710,181 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         }
     }
 }
+}
+
+/**
+ * 全屏播放器静态区：Header / 封面信息 / 控制行 / 歌词头
+ * 参数均为稳定类型（String/Color/Boolean/remembered lambda/按曲目变更的 now）
+ * 进度 tick 时调用方重组但这些子树的参数全 equal，Compose 直接 skip
+ */
+@Composable private fun PlayerSheetHeader(
+    title: String,
+    contentColor: Color,
+    downloadEnabled: Boolean,
+    queueLabel: String,
+    onDismiss: () -> Unit,
+    onOpenDownload: () -> Unit,
+    onToggleQueue: () -> Unit
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 24.dp)) {
+        IconButton(onClick = onDismiss, modifier = Modifier.offset(x = (-8).dp)) { Icon(Icons.Default.KeyboardArrowDown, "关闭", tint = contentColor) }
+        Text(title, Modifier.weight(1f).offset(x = (-8).dp), fontWeight = FontWeight.Bold, color = contentColor)
+        IconButton(onClick = onOpenDownload, enabled = downloadEnabled) { Icon(Icons.Default.Download, "下载", tint = contentColor) }
+        IconButton(onClick = onToggleQueue) { Icon(Icons.Default.QueueMusic, queueLabel, tint = contentColor) }
+    }
+}
+
+@Composable private fun PlayerSheetCover(
+    now: NowPlaying?,
+    contentColor: Color,
+    subContentColor: Color,
+    onOpenSwitchQuality: () -> Unit
+) {
+    val item = now?.item
+    Column(Modifier.padding(horizontal = 24.dp)) {
+        Spacer(Modifier.height(12.dp))
+        Box(modifier = Modifier.size(320.dp).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(16.dp)).background(Color(0xffdbe1ff)), contentAlignment = Alignment.Center) {
+            if (item?.artwork.isNullOrBlank()) Icon(imageVector = Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(112.dp), tint = Color.White)
+            else AsyncImage(model = item?.artwork, contentDescription = item?.title, modifier = Modifier.fillMaxSize())
+        }
+        Spacer(Modifier.height(24.dp))
+        Row(verticalAlignment = Alignment.Bottom) {
+            Column(Modifier.weight(1f)) {
+                Text(item?.title ?: "暂无播放", fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = contentColor)
+                Text(item?.artist ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis, color = contentColor)
+                Text(
+                    if (now != null) "${formatDuration(item?.durationMs ?: 0)} · ${MusicQuality.labelOf(now.qualityKey)}${now.size?.let { " · ${formatSize(it)}" } ?: ""} · ${item?.platform}"
+                    else "从搜索或歌单中选择歌曲播放",
+                    fontSize = 12.sp, color = subContentColor
+                )
+            }
+            IconButton(onClick = onOpenSwitchQuality, enabled = now != null, modifier = Modifier.offset(x = 8.dp, y = 12.dp)) { Icon(Icons.Default.HighQuality, "音质", tint = contentColor) }
+        }
+    }
+}
+
+@Composable private fun PlayerSheetControls(
+    now: NowPlaying?,
+    playing: Boolean,
+    buffering: Boolean,
+    isFavorite: Boolean,
+    contentColor: Color,
+    onToggleFavorite: () -> Unit,
+    onPrev: () -> Unit,
+    onToggle: () -> Unit,
+    onNext: () -> Unit,
+    onOpenAddPlaylist: () -> Unit
+) {
+    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = onToggleFavorite, enabled = now != null) { Icon(imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = "收藏", tint = contentColor) }
+        IconButton(onClick = onPrev, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "上一首", tint = contentColor, modifier = Modifier.size(36.dp)) }
+        if ((now?.loading == true || buffering) && now != null) {
+            Box(Modifier.size(64.dp), Alignment.Center) {
+                CircularProgressIndicator(Modifier.size(48.dp), color = contentColor, strokeWidth = 3.dp)
+            }
+        } else {
+            IconButton(onClick = onToggle, modifier = Modifier.size(64.dp), enabled = now != null) { Icon(imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = "播放", tint = contentColor, modifier = Modifier.size(54.dp)) }
+        }
+        IconButton(onClick = onNext, enabled = now != null, modifier = Modifier.size(48.dp)) { Icon(imageVector = Icons.Default.SkipNext, contentDescription = "下一首", tint = contentColor, modifier = Modifier.size(36.dp)) }
+        IconButton(onClick = onOpenAddPlaylist, enabled = now != null) { Icon(imageVector = Icons.Default.PlaylistAdd, contentDescription = "加歌单", tint = contentColor) }
+    }
+}
+
+@Composable private fun PlayerLyricHeader(
+    contentColor: Color,
+    onOpenLyricFullscreen: () -> Unit
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)) {
+        Text("歌词", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), color = contentColor)
+        IconButton(onClick = onOpenLyricFullscreen, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Fullscreen, "全屏歌词", modifier = Modifier.size(20.dp), tint = contentColor) }
+    }
+}
+
+/**
+ * 轻量进度条：替代 Material3 Slider
+ * Slider 自带手势状态机/涟漪/semantics/内部动画
+ */
+@Composable private fun PlayerSeekZone(
+    trackKey: String?,
+    positionMs: Long,
+    durationMs: Long,
+    timeColor: Color,
+    progressActive: Color,
+    progressInactive: Color,
+    dotColor: Color,
+    onSeek: (Long) -> Unit
+) {
+    var seeking by remember(trackKey) { mutableStateOf(false) }
+    var seekFrac by remember(trackKey) { mutableStateOf(0f) }
+    var seekTarget by remember(trackKey) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(positionMs) {
+        seekTarget?.let { if (kotlin.math.abs(positionMs - it) < 1500) seekTarget = null }
+    }
+    LaunchedEffect(seekTarget) {
+        if (seekTarget != null) { delay(5000); seekTarget = null }
+    }
+    val shownPosMs = when {
+        seeking && durationMs > 0 -> (seekFrac * durationMs).toLong()
+        seekTarget != null && durationMs > 0 -> seekTarget!!
+        else -> positionMs
+    }
+    val shownFrac = if (durationMs > 0) (shownPosMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+    val enabled = durationMs > 0
+    Column(Modifier.padding(horizontal = 24.dp)) {
+        BoxWithConstraints(Modifier.fillMaxWidth().height(28.dp)) {
+            val barWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
+            val barWidthDp = maxWidth
+            val frac = (if (seeking) seekFrac else shownFrac).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier.fillMaxSize()
+                    .pointerInput(enabled, barWidthPx, durationMs) {
+                        if (!enabled) return@pointerInput
+                        detectHorizontalDragGestures(
+                            onDragStart = { offset ->
+                                seeking = true
+                                seekFrac = (offset.x / barWidthPx).coerceIn(0f, 1f)
+                            },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                seekFrac = (seekFrac + dragAmount / barWidthPx).coerceIn(0f, 1f)
+                            },
+                            onDragEnd = {
+                                seeking = false
+                                if (durationMs > 0) {
+                                    val target = (seekFrac * durationMs).toLong()
+                                    seekTarget = target
+                                    onSeek(target)
+                                }
+                            },
+                            onDragCancel = { seeking = false }
+                        )
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.width(barWidthDp * frac).height(5.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape).background(progressActive)
+                    )
+                    Box(
+                        Modifier.weight(1f).height(3.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape).background(progressInactive)
+                    )
+                }
+                val dotSize = 10.dp
+                val dotOffset = (barWidthDp * frac - dotSize / 2).coerceIn(0.dp, barWidthDp - dotSize)
+                Box(
+                    Modifier.align(Alignment.CenterStart).padding(start = dotOffset).size(dotSize)
+                        .clip(androidx.compose.foundation.shape.CircleShape).background(dotColor)
+                )
+            }
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(formatDuration(shownPosMs), fontSize = 12.sp, color = timeColor)
+            Spacer(Modifier.weight(1f))
+            Text(formatDuration(durationMs), fontSize = 12.sp, color = timeColor)
+        }
+    }
 }
 
 @Composable fun LyricsView(
@@ -808,18 +931,50 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
             baseUptime = android.os.SystemClock.uptimeMillis()
             if (!playing) displayPosMs = positionMs
         }
-        LaunchedEffect(playing, lines) {
+        // 前台门控：Activity 不可见（后台）时 ticker 挂起，不写任何 State
+        // 后台零重组。回到前台 effect 重启；位置精度不受影响——base+uptime 插值
+        // 横跨后台仍然成立（elapsed 含后台时长），ViewModel 回前台还会立刻刷新对齐
+        val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+        var uiActive by remember { mutableStateOf(true) }
+        DisposableEffect(lifecycleOwner) {
+            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                uiActive = event.targetState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+            }
+            uiActive = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+            lifecycleOwner.lifecycle.addObserver(obs)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+        }
+        // 自适应节流（v4）：有逐字 60ms（卡拉 OK 约 16fps）；纯行级 80ms
+        // 位置本身由 base+uptime 插值（精度不受 250ms 轮询影响），ticker 只决定刷新粒度
+        val hasKaraoke = remember(lines) { lines.any { it.words.isNotEmpty() } }
+        LaunchedEffect(playing, lines, uiActive) {
             if (!playing) {
                 displayPosMs = basePosMs
                 return@LaunchedEffect
             }
+            if (!uiActive) awaitCancellation()
+            val stepMs = if (hasKaraoke) 60L else 80L
             while (true) {
-                withFrameNanos {
-                    displayPosMs = basePosMs + (android.os.SystemClock.uptimeMillis() - baseUptime)
-                }
+                delay(stepMs)
+                displayPosMs = basePosMs + (android.os.SystemClock.uptimeMillis() - baseUptime)
             }
         }
-        val currentIndex = remember(lines, displayPosMs) { lines.indexOfLast { it.timeMs <= displayPosMs }.coerceAtLeast(0) }
+        // 二分替代线性扫描：lines 已按 timeMs 有序，高频 tick 下 O(log n)
+        val currentIndex = remember(lines, displayPosMs) {
+            if (lines.isEmpty()) 0
+            else {
+                var lo = 0
+                var hi = lines.size - 1
+                var ans = 0
+                while (lo <= hi) {
+                    val mid = (lo + hi) ushr 1
+                    if (lines[mid].timeMs <= displayPosMs) { ans = mid; lo = mid + 1 } else hi = mid - 1
+                }
+                ans
+            }
+        }
+        // 上次锚定行：只在 effect 内读写，无 composable 读取，写不触发重组
+        var lastAnchorIndex by remember(lines) { mutableIntStateOf(currentIndex) }
         suspend fun scrollCurrentToAnchor(index: Int, animated: Boolean) {
             val i = index.coerceIn(lines.indices)
             val anchorPx = with(density) { (maxHeight * markerFraction).toPx() }
@@ -829,7 +984,8 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                 if (target != null) {
                     val delta = (target.offset + target.size / 2) - anchorPx
                     if (kotlin.math.abs(delta) > 1f) {
-                        if (animated) listState.animateScrollBy(delta, tween(200)) else listState.scrollBy(delta)
+                        // 相邻行跟随 150ms
+                        if (animated) listState.animateScrollBy(delta, tween(150)) else listState.scrollBy(delta)
                     }
                     return
                 }
@@ -849,9 +1005,16 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
                 }
             }
         }
-        LaunchedEffect(lines) { resumeFollowJob?.cancel(); resumeFollowJob = null; follow = true; scrollCurrentToAnchor(currentIndex, false) }
-        LaunchedEffect(currentIndex) { if (follow) scrollCurrentToAnchor(currentIndex, true) }
-        LaunchedEffect(follow) { if (follow) scrollCurrentToAnchor(currentIndex, true) }
+        LaunchedEffect(lines) { resumeFollowJob?.cancel(); resumeFollowJob = null; follow = true; lastAnchorIndex = currentIndex; scrollCurrentToAnchor(currentIndex, false) }
+        // 跳行（seek/切歌后跨越多行）直接定位
+        // 正常相邻行切换保持 200ms 跟随滑动。lastAnchorIndex 无读者，写操作不触发重组
+        LaunchedEffect(currentIndex) {
+            if (!follow) { lastAnchorIndex = currentIndex; return@LaunchedEffect }
+            val jumped = kotlin.math.abs(currentIndex - lastAnchorIndex) > 3
+            lastAnchorIndex = currentIndex
+            scrollCurrentToAnchor(currentIndex, !jumped)
+        }
+        LaunchedEffect(follow) { if (follow) { lastAnchorIndex = currentIndex; scrollCurrentToAnchor(currentIndex, true) } }
         LaunchedEffect(listState) {
             listState.interactionSource.interactions.collect { interaction ->
                 when (interaction) {
@@ -865,7 +1028,7 @@ internal fun applyGradientBarIcons(window: Window, lightBackground: Boolean) {
         val padTop = 16.dp
         val padBottom = maxHeight * 0.5f
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(top = padTop, bottom = padBottom)) {
-            itemsIndexed(lines) { index, line ->
+            itemsIndexed(lines, key = { index, line -> "${line.timeMs}_$index" }) { index, line ->
                 val active = index == currentIndex
                 // 点按跳转：整行可点击，seek 到该行起始时间（拖拽滚动不受影响）
                 val seekModifier = if (onSeek != null) {
