@@ -3,6 +3,7 @@ package com.bakamusic.android.plugin
 import com.bakamusic.android.data.*
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 
 /** 按音源优先级路由插件调用，已禁用与未注册的插件永不被调用。 */
 class PluginRouter(private val manager: PluginManager) {
@@ -114,18 +115,31 @@ class PluginRouter(private val manager: PluginManager) {
         return resolveMediaByKey(item, quality.key)
     }
 
+    /** 单音质解析：失败延时重试一次，仍失败返回 null 由外层换下一档 */
+    private suspend fun resolveOne(plugin: MusicPlugin, item: MediaItem, quality: String): MediaItem? {
+        runAbortable { plugin.getMediaSource(item, quality) }?.let { return it }
+        delay(200)
+        return runAbortable { plugin.getMediaSource(item, quality) }
+    }
+
+    /** 单音质解析（带实际命中音质），语义同 resolveOne */
+    private suspend fun resolveOneDetailed(plugin: MusicPlugin, item: MediaItem, quality: String): Pair<MediaItem, String>? {
+        runAbortable { plugin.getMediaSourceDetailed(item, quality) }?.let { return it }
+        delay(200)
+        return runAbortable { plugin.getMediaSourceDetailed(item, quality) }
+    }
+
     /** 按音质键解析：仅请求当前平台插件，不跨平台解析 */
     suspend fun resolveMediaByKey(item: MediaItem, qualityKey: String): MediaItem? {
-        val plugin = activeAdapters().firstOrNull { it.platform == item.platform }
+        val plugin = findAdapterByPlatform(item.platform)
             ?: run {
                 Log.d("BakaPlugin", "无当前平台适配器，拒绝解析: ${item.platform}:${item.id}")
                 return null
             }
         val current = maybeEnrich(plugin, item)
-        val fullOrder = qualityOrderLowerFirst(qualityKey)
-        val tried = filterQualityOrderByDeclared(current, fullOrder).ifEmpty { fullOrder }
+        val tried = playbackQualityOrder(current, qualityKey)
         for (q in tried) {
-            val res = runAbortable { plugin.getMediaSource(current, q) }
+            val res = resolveOne(plugin, current, q)
             if (res?.mediaUrl?.startsWith("http", true) == true) return res
         }
         // 后备：使用 qualities 自带的 url
@@ -144,19 +158,23 @@ class PluginRouter(private val manager: PluginManager) {
     suspend fun resolveForPlaybackDetailed(
         item: MediaItem,
         defaultQualityKey: String,
-        excludeQualities: Set<String> = emptySet()
+        excludeQualities: Set<String> = emptySet(),
+        cascade: Boolean = true,
+        onTrying: ((quality: String, size: Long?) -> Unit)? = null
     ): Pair<MediaItem, String>? {
-        val plugin = activeAdapters().firstOrNull { it.platform == item.platform }
+        val plugin = findAdapterByPlatform(item.platform)
             ?: run {
                 Log.d("BakaPlugin", "无当前平台适配器，拒绝解析: ${item.platform}:${item.id}")
                 return null
             }
         val current = maybeEnrich(plugin, item)
-        val fullOrder = qualityOrderLowerFirst(defaultQualityKey)
-        val tried = filterQualityOrderByDeclared(current, fullOrder).ifEmpty { fullOrder }
+        // 手动切音质只试所选单档，不自动级联
+        val tried = if (cascade) playbackQualityOrder(current, defaultQualityKey) else listOf(defaultQualityKey)
         for (q in tried) {
             if (excludeQualities.contains(q)) continue
-            val res = runAbortable { plugin.getMediaSourceDetailed(current, q) }
+            // 上报当前尝试档，供界面实时跟随
+            onTrying?.invoke(q, current.qualities[q]?.size)
+            val res = resolveOneDetailed(plugin, current, q)
             if (res?.first?.mediaUrl?.startsWith("http", true) == true) {
                 val (media, actual) = res
                 Log.d("BakaPlugin", "解析命中 ${current.platform}:${current.id} quality=$actual(requested=$q) via ${plugin.platform}")
@@ -173,7 +191,7 @@ class PluginRouter(private val manager: PluginManager) {
     }
     suspend fun lyric(item: MediaItem): LyricSource? {
         // 仅请求当前平台插件，各平台 id 体系不同
-        val plugin = activeAdapters().firstOrNull { it.platform == item.platform }
+        val plugin = findAdapterByPlatform(item.platform)
             ?: run {
                 Log.d("BakaPlugin", "无当前平台适配器，跳过歌词: ${item.platform}:${item.id}")
                 return null

@@ -56,11 +56,20 @@ fun qualityOrderLowerFirst(defaultKey: String): List<String> {
     return listOf(defaultKey) + left + right
 }
 
-fun filterQualityOrderByDeclared(item: MediaItem, order: List<String>): List<String> {
-    if (item.qualities.isEmpty()) return order
-    val declared = item.qualities.keys
-    val filtered = order.filter { declared.contains(it) }
-    return filtered.ifEmpty { declared.sortedBy(::qualityRankOf) }
+/** 播放降级顺序：默认音质起逐级向低尝试，不主动探测更高音质 */
+fun qualityOrderDownFrom(defaultKey: String): List<String> {
+    val idx = QUALITY_KEYS_ORDERED.indexOf(defaultKey)
+    if (idx < 0) return listOf(defaultKey)
+    return listOf(defaultKey) + QUALITY_KEYS_ORDERED.subList(0, idx).reversed()
+}
+
+/** 播放实际尝试顺序：已知音质只走默认及更低；未知音质才全量探测 */
+fun playbackQualityOrder(item: MediaItem, defaultKey: String): List<String> {
+    if (item.qualities.isEmpty()) return qualityOrderLowerFirst(defaultKey)
+    val tried = qualityOrderDownFrom(defaultKey).filter { item.qualities.containsKey(it) }
+    if (tried.isNotEmpty()) return tried
+    // 可用音质全高于默认时按从低到高兜底，总比直接失败好
+    return item.qualities.keys.sortedBy(::qualityRankOf)
 }
 
 data class MediaItem(

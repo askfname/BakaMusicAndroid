@@ -49,9 +49,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var serviceItemCount by mutableStateOf(0)
         private set
     
+    /** 设置中的默认播放音质：加载占位与解析起点都用它，避免误显示最高音质 */
+    var defaultPlayQuality by mutableStateOf("flac")
+        private set
+
     var playError by mutableStateOf<String?>(null)
     var playerError by mutableStateOf<String?>(null)
-    var playerErrorRetry by mutableStateOf(true)
+    /** 手动切音质失败时才允许单步降级重试，自动播放失败直接下一曲 */
+    var playerErrorRetry by mutableStateOf(false)
     
     var lastEndedKey by mutableStateOf<String?>(null)
     var lyricLines by mutableStateOf(emptyList<LyricLine>())
@@ -74,6 +79,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var holdSinceMs: Long = 0L
 
     init {
+        // 跟随设置中的默认播放音质，供加载占位显示
+        viewModelScope.launch {
+            repository.playQuality.collect { defaultPlayQuality = it }
+        }
         // 恢复播放会话
         sessionStore.load()?.let { saved ->
             nowPlaying = saved.current?.let {
@@ -110,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@addErrorListener
             }
             playerError = msg
-            playerErrorRetry = true
+            playerErrorRetry = false
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
         }
         playbackController.addAudibleListener {
@@ -263,11 +272,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         positionMs = 0
         durationMs = item.durationMs
         queueIndex = index
-        val best = item.qualities.keys.maxByOrNull(::qualityRankOf) ?: "320k"
-        nowPlaying = NowPlaying(item, "", best, item.qualities[best]?.size, loading = true)
-        
+        // 占位用默认播放音质（实际解析起点），加载中/失败不再误显示最高音质
+        val start = defaultPlayQuality
+        nowPlaying = NowPlaying(item, "", start, item.qualities[start]?.size, loading = true)
+
         playRequestJob = viewModelScope.launch {
-            val defaultPlayQuality = repository.playQuality.first()
             var resolveEmpty = false
             val np: NowPlaying? = withContext(Dispatchers.IO) {
                 if (item.platform == "BakaMusic") {
@@ -292,7 +301,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 
                 val resPair = try {
                     val r = withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
-                        sourceService.resolveForPlaybackDetailed(item, defaultPlayQuality, excludeQualities)
+                        sourceService.resolveForPlaybackDetailed(item, defaultPlayQuality, excludeQualities) { trying, tryingSize ->
+                            // 自动逐级重试时界面实时跟随当前尝试档
+                            if (token == playToken) {
+                                nowPlaying?.takeIf { it.key == key && it.loading }?.let {
+                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size)
+                                }
+                            }
+                        }
                     }
                     if (r == null) resolveEmpty = true
                     r
@@ -301,11 +317,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         if (nowPlaying?.key == key) nowPlaying = nowPlaying?.copy(loading = false)
                         if (e is MediaResolveTimeoutException || e is TimeoutCancellationException) {
                             playerError = "播放器错误 3003：Source error"
-                            playerErrorRetry = true
+                            playerErrorRetry = false
                         } else if (e is CancellationException) {
                             // 协程取消，无需处理
                         } else {
-                            playerError = "该歌曲暂无可用音源"; playerErrorRetry = false
+                            playerError = "该歌曲暂无可用音源"
+                            playerErrorRetry = false
                         }
                     }
                     null
@@ -316,7 +333,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     ?: run {
                         if (token == playToken) {
                             if (nowPlaying?.key == key) nowPlaying = nowPlaying?.copy(loading = false)
-                            playerError = "该歌曲暂无可用音源"; playerErrorRetry = false
+                            playerError = "该歌曲暂无可用音源"
+                            playerErrorRetry = false
                         }
                         return@withContext null
                     }
@@ -401,12 +419,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stepPrev() = advance(-1)
 
-    fun retryLowerQuality(cur: NowPlaying) {
+    /** 当前显示档的下一低档（仅歌曲已声明的），没有则返回 null */
+    private fun lowerQualityKey(item: MediaItem, fromKey: String): String? {
+        val idx = QUALITY_KEYS_ORDERED.indexOf(fromKey)
+        if (idx < 0) return null
+        return QUALITY_KEYS_ORDERED.subList(0, idx).reversed()
+            .firstOrNull { item.qualities.containsKey(it) }
+    }
+
+    /** 手动切音质失败后的单步降级：只低一档，不自动级联 */
+    fun retryLowerQuality() {
+        val cur = nowPlaying ?: return
         playerError = null
-        val order = QUALITY_KEYS_ORDERED
-        val curIdx = order.indexOf(cur.qualityKey)
-        val exclude = (if (curIdx >= 0) order.subList(curIdx, order.size) else listOf(cur.qualityKey)).toSet()
-        startTrack(cur.item, queueIndex, exclude)
+        playerErrorRetry = false
+        lowerQualityKey(cur.item, cur.qualityKey)?.let { switchQuality(cur.item, it) }
     }
 
     fun downloadItem(item: MediaItem, quality: String) {
@@ -424,41 +450,65 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun switchQuality(item: MediaItem, newKey: String) {
+        // 与 startTrack 同一代际：旧任务与旧流的回调不再触碰新一轮 loading
+        playToken++
+        val token = playToken
         playRequestJob?.cancel()
         sourceService.cancelPendingRequests()
+        holdPositionMs = null
         playRequestJob = viewModelScope.launch {
             val keepPos = playbackController.snapshot().positionMs
             val itemKey = "${item.platform}:${item.id}"
-            nowPlaying?.takeIf { it.key == itemKey }?.let { nowPlaying = it.copy(loading = true) }
-            
+            // 先清旧流：旧流随后可听/报错会提前关掉新一轮 loading
+            playbackController.clear()
+            // 界面立即切到目标音质，不等解析完成
+            nowPlaying?.takeIf { it.key == itemKey }?.let {
+                nowPlaying = it.copy(qualityKey = newKey, size = item.qualities[newKey]?.size ?: it.size, loading = true)
+            }
+
+            // 手动切换只试所选单档，失败由用户点按钮再单步降级
             val pair = try {
                 withContext(Dispatchers.IO) {
                     withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
-                        sourceService.resolveForPlaybackDetailed(item, newKey)
+                        sourceService.resolveForPlaybackDetailed(item, newKey, cascade = false) { trying, tryingSize ->
+                            if (token == playToken) {
+                                nowPlaying?.takeIf { it.key == itemKey && it.loading }?.let {
+                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size)
+                                }
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
+                if (token != playToken) return@launch
                 if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)
                 if (e is MediaResolveTimeoutException || e is TimeoutCancellationException) {
-                    playerError = "播放器错误 3003：Source error"; playerErrorRetry = true
+                    playerError = "播放器错误 3003：Source error"
+                    playerErrorRetry = lowerQualityKey(item, newKey) != null
                 } else if (e !is CancellationException) {
-                    playerError = "该歌曲暂无可用音源"; playerErrorRetry = false
+                    playerError = "该歌曲暂无可用音源"
+                    playerErrorRetry = lowerQualityKey(item, newKey) != null
                 }
                 return@launch
             } ?: run {
+                if (token != playToken) return@launch
                 if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)
-                playerError = "该歌曲暂无可用音源"; playerErrorRetry = false
+                playerError = "该歌曲暂无可用音源"
+                playerErrorRetry = lowerQualityKey(item, newKey) != null
                 return@launch
             }
-            
+
             val (res, q) = pair
             val url = res.mediaUrl?.takeIf { it.startsWith("http", true) }
                 ?: run {
+                    if (token != playToken) return@launch
                     if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)
-                    playerError = "该歌曲暂无可用音源"; playerErrorRetry = false
+                    playerError = "该歌曲暂无可用音源"
+                    playerErrorRetry = lowerQualityKey(item, newKey) != null
                     return@launch
                 }
-            
+
+            if (token != playToken) return@launch
             val np = NowPlaying(res.copy(mediaUrl = null, mediaHeaders = emptyMap()), url, q, res.qualities[q]?.size, res.mediaHeaders, loading = false, backupUrls = res.backupUrls.filter { it != url })
             if (resolvedCacheGen == sourceService.dataVersion()) {
                 resolvedCache[itemKey] = np
@@ -471,6 +521,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             runCatching {
                 playbackController.play(np.item.copy(mediaUrl = url, mediaHeaders = res.mediaHeaders))
             }.onFailure {
+                if (token != playToken) return@launch
                 holdPositionMs = null
                 playError = "播放失败：${it.message}"
                 if (nowPlaying?.key == itemKey) nowPlaying = nowPlaying?.copy(loading = false)

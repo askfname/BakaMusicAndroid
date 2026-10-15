@@ -347,8 +347,6 @@ private fun showSystemBars(window: Window) {
     }
 
     viewModel.playerError?.let { msg ->
-        val cur = viewModel.nowPlaying
-        val canRetry = cur != null && viewModel.playerErrorRetry
         var nextCountdown by remember { mutableStateOf(5) }
         LaunchedEffect(msg) {
             nextCountdown = 5
@@ -373,9 +371,9 @@ private fun showSystemBars(window: Window) {
                         onClick = { viewModel.playerError = null },
                         contentPadding = PaddingValues(horizontal = 8.dp)
                     ) { Text("关闭", maxLines = 1) }
-                    if (canRetry) {
+                    if (viewModel.playerErrorRetry) {
                         TextButton(
-                            onClick = { viewModel.retryLowerQuality(cur!!) },
+                            onClick = { viewModel.retryLowerQuality() },
                             contentPadding = PaddingValues(horizontal = 8.dp)
                         ) { Text("换更低音质重试", maxLines = 1) }
                     }

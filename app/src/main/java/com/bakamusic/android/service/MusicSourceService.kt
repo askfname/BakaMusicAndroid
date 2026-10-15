@@ -113,6 +113,6 @@ class MusicSourceService(context: Context, private val router: PluginRouter = Pl
     suspend fun resolve(item: MediaItem, quality: MusicQuality) = ensureLoaded().let { router.resolveMedia(item, quality) }
     suspend fun resolveByKey(item: MediaItem, qualityKey: String) = ensureLoaded().let { router.resolveMediaByKey(item, qualityKey) }
     suspend fun resolveForPlayback(item: MediaItem, defaultQualityKey: String) = ensureLoaded().let { router.resolveForPlayback(item, defaultQualityKey) }
-    suspend fun resolveForPlaybackDetailed(item: MediaItem, defaultQualityKey: String, excludeQualities: Set<String> = emptySet()) = ensureLoaded().let { router.resolveForPlaybackDetailed(item, defaultQualityKey, excludeQualities) }
+    suspend fun resolveForPlaybackDetailed(item: MediaItem, defaultQualityKey: String, excludeQualities: Set<String> = emptySet(), cascade: Boolean = true, onTrying: ((quality: String, size: Long?) -> Unit)? = null) = ensureLoaded().let { router.resolveForPlaybackDetailed(item, defaultQualityKey, excludeQualities, cascade, onTrying) }
     suspend fun lyrics(item: MediaItem) = ensureLoaded().let { router.lyric(item) }
 }

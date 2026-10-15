@@ -976,10 +976,6 @@ function getTopListDetail(topListItem) {"""
 
         private inner class HttpBridge {
             private val open = ConcurrentHashMap.newKeySet<HttpURLConnection>()
-            /** host 熔断：连续传输层失败 2 次后 60s 内直接快速失败。 */
-            private val hostFailStreak = ConcurrentHashMap<String, Int>()
-            private val hostBreakerUntil = ConcurrentHashMap<String, Long>()
-            private val breakerWindowMs = 60_000L
             /** 插件未指定 UA 时的默认值 */
             private val DEFAULT_PLUGIN_UA =
                 "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36 BakaMusic/1.0"
@@ -1000,8 +996,10 @@ function getTopListDetail(topListItem) {"""
             }
 
             /**
-             * 插件 HTTP 执行：首试复用连接，遇连接复用类错误
-             * （unexpected end of stream / Connection reset）时用 Connection:close 再试一次。
+             * 插件 HTTP 执行：首试复用连接，遇传输层偶发错误
+             * （超时/断连）时用 Connection:close 再试一次。
+             * 无 host 黑名单：慢上游只应等足超时，不应被拉黑
+             * （黑名单会把响应慢误判为网络死亡，导致整站 60s 不可播）。
              */
             private fun executeWithRetry(configText: String): String {
                 val config = JSONObject(configText)
@@ -1022,7 +1020,7 @@ function getTopListDetail(topListItem) {"""
                 require(!isPluginPrivateHost(host)) { "插件不能访问本机或内网地址" }
                 val method = config.optString("method", "GET").uppercase()
                 val isBinary = config.optString("responseType").equals("arraybuffer", true) || config.optString("responseType").equals("blob", true)
-                // JS 指定的超时（如 track_v2 20s），钳制在 3s~60s；整体仍受上层 50s 预算约束
+                // JS 指定的超时（如 track_v2 20s），钳制在 3s~60s；整体仍受上层 20s 解析预算约束
                 val timeoutMs = runCatching { config.optInt("timeout", 15_000) }.getOrDefault(15_000).coerceIn(3_000, 60_000)
                 // 默认跟随 5 次重定向，与 axios 默认语义对齐
                 val maxRedirects = if (config.has("maxRedirects")) {
@@ -1063,30 +1061,17 @@ function getTopListDetail(topListItem) {"""
                     }
                 }
                 val hostPath = host + runCatching { URI(url).path }.getOrDefault("")
-                // 熔断：该 host 连续传输层失败后快速失败
-                if ((hostBreakerUntil[host] ?: 0L) > System.currentTimeMillis()) {
-                    Log.d("BakaPlugin", "[$platformName][http] $method $hostPath 熔断快速失败")
-                    return JSONObject().put("__error", "网络暂不可用，快速回落").toString()
-                }
                 var lastError: Throwable? = null
                 for (attempt in 0..1) {
                     try {
-                        val result = exchangeOnce(
+                        return exchangeOnce(
                             url, hostPath, method, headers, contentType,
                             bodyBytes, bodyKind, hasBody, isBinary, timeoutMs, maxRedirects,
                             closeConnection = attempt == 1
                         )
-                        hostFailStreak.remove(host)
-                        hostBreakerUntil.remove(host)
-                        return result
                     } catch (e: Throwable) {
-                        // 切歌取消导致的断连是预期行为，直接抛出且不计入熔断
+                        // 切歌取消导致的断连是预期行为，直接抛出且不重试
                         if (isIntentionalCancel(e)) throw e
-                        if (isRetryableNetworkError(e)) {
-                            val streak = (hostFailStreak[host] ?: 0) + 1
-                            hostFailStreak[host] = streak
-                            if (streak >= 2) hostBreakerUntil[host] = System.currentTimeMillis() + breakerWindowMs
-                        }
                         if (attempt == 1 || !isRetryableNetworkError(e)) throw e
                         lastError = e
                         Log.w("BakaPlugin", "[$platformName][http] $method $hostPath 失败重试: ${e.message}")
