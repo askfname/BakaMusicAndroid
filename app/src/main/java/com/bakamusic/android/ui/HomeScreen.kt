@@ -84,7 +84,9 @@ import kotlinx.coroutines.*
         sourcesLoaded = true
     }
 
-    LaunchedEffect(Unit) { reloadSources() }
+    // 注册表代际驱动：内嵌设置页改插件后无 ON_RESUME，靠此刷新
+    val registryGen by sourceService.generation.collectAsStateWithLifecycle(initialValue = sourceService.generation.value)
+    LaunchedEffect(registryGen) { reloadSources() }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -432,7 +434,9 @@ import kotlinx.coroutines.*
         sourcesLoaded = true
     }
 
-    LaunchedEffect(Unit) { reloadSources() }
+    // 注册表代际驱动：内嵌设置页改插件后无 ON_RESUME，靠此刷新
+    val registryGen by sourceService.generation.collectAsStateWithLifecycle(initialValue = sourceService.generation.value)
+    LaunchedEffect(registryGen) { reloadSources() }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->

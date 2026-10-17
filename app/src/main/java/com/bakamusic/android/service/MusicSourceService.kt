@@ -8,55 +8,73 @@ import java.util.Collections
 import java.util.WeakHashMap
 
 /**
- * 搜索、歌单导入、播放地址与歌词的统一入口。
- * UI 与下载层应经由本服务调用，不直接选择插件；PluginRouter 按启用优先级路由。
+ * 搜索、歌单导入、播放地址与歌词的统一入口
+ * UI 与下载层应经由本服务调用，不直接选择插件；PluginRouter 按启用优先级路由
  */
 class MusicSourceService(context: Context, private val router: PluginRouter = PluginRouter(PluginManager(context.applicationContext))) {
     private val appContext = context.applicationContext
     private val manager = PluginManager(appContext)
     private val runtime = QuickJsPluginRuntime(manager)
+    private val lxManager = LxSourceManager(appContext)
     private var loaded = false
     /** 已加载的注册表指纹：插件变更后下次调用自动重载 */
     private var loadedVersion: Long = -1
+    /** LX 注册表指纹 */
+    private var loadedLxVersion: Long = -1
     /** 串行化加载：避免并发替换 QuickJS 上下文 */
     private val loadMutex = kotlinx.coroutines.sync.Mutex()
+    /** 注册表代际：插件增删改/启停用/排序/LX变更后推进，UI 订阅后自动重查列表 */
+    private val _generation = kotlinx.coroutines.flow.MutableStateFlow(0L)
+    val generation: kotlinx.coroutines.flow.StateFlow<Long> = _generation
 
     init {
+        router.lxResolver = LxResolver(lxManager)
         live.add(this)
     }
 
     fun close() {
         runtime.destroy()
+        runCatching { lxManager.close() }
         live.remove(this)
     }
 
     private suspend fun ensureLoaded() {
-        if (loaded && manager.dataVersion() == loadedVersion) return
-        loadMutex.withLock {
-            if (loaded && manager.dataVersion() == loadedVersion) return
-            router.replaceAll(runtime.loadEnabled())
-            loaded = true
-            // 取加载完成后的最新指纹
-            loadedVersion = manager.dataVersion()
+        if (!(loaded && manager.dataVersion() == loadedVersion && lxManager.dataVersion() == loadedLxVersion)) {
+            loadMutex.withLock {
+                if (!(loaded && manager.dataVersion() == loadedVersion && lxManager.dataVersion() == loadedLxVersion)) {
+                    router.replaceAll(runtime.loadEnabled())
+                    loaded = true
+                    // 取加载完成后的最新指纹
+                    loadedVersion = manager.dataVersion()
+                    lxManager.loadEnabled()
+                    loadedLxVersion = lxManager.dataVersion()
+                }
+            }
         }
+        _generation.value = dataVersion()
     }
 
-    /** 插件变更后调用，重新加载 QuickJS 音源。 */
+    /** 插件变更后调用，重新加载 QuickJS 音源 */
     suspend fun refresh() {
         // 注册表无变化时跳过重建，避免中断正在提供服务的旧实例
-        if (loaded && manager.dataVersion() == loadedVersion) return
-        loadMutex.withLock {
-            if (loaded && manager.dataVersion() == loadedVersion) return
-            router.replaceAll(runtime.loadEnabled())
-            loaded = true
-            loadedVersion = manager.dataVersion()
+        if (!(loaded && manager.dataVersion() == loadedVersion && lxManager.dataVersion() == loadedLxVersion)) {
+            loadMutex.withLock {
+                if (!(loaded && manager.dataVersion() == loadedVersion && lxManager.dataVersion() == loadedLxVersion)) {
+                    router.replaceAll(runtime.loadEnabled())
+                    loaded = true
+                    loadedVersion = manager.dataVersion()
+                    lxManager.loadEnabled()
+                    loadedLxVersion = lxManager.dataVersion()
+                }
+            }
         }
+        _generation.value = dataVersion()
     }
 
     companion object {
         private val live: MutableSet<MusicSourceService> =
             Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<MusicSourceService, Boolean>()))
-        /** 插件变更后调用：所有现存运行时立即重载新插件。 */
+        /** 插件变更后调用：所有现存运行时立即重载新插件 */
         suspend fun refreshAll() {
             val snapshot: List<MusicSourceService> = synchronized(live) { live.toList() }
             snapshot.forEach { service ->
@@ -69,8 +87,18 @@ class MusicSourceService(context: Context, private val router: PluginRouter = Pl
     fun enabledSourceNames(): List<String> = manager.enabledPluginNames()
     /** 注册表元信息，供音源选择组件展示，不调用 JS 运行时 */
     fun installedPlugins(): List<InstalledPlugin> = manager.plugins()
-    /** 插件注册表指纹，供播放地址缓存失效判断 */
-    fun dataVersion(): Long = manager.dataVersion()
+    /** 插件注册表指纹（含 LX），供播放地址缓存失效判断 */
+    fun dataVersion(): Long = maxOf(manager.dataVersion(), lxManager.dataVersion())
+
+    /** 确保 LX 脚本已加载（设置页打开时调用） */
+    suspend fun ensureLxLoaded() = ensureLoaded()
+
+    /** LX 取流脚本管理：供设置页调用 */
+    fun installedLx(): List<LxPluginDescriptor> = lxManager.installed()
+    suspend fun installLxLocal(file: java.io.File) = lxManager.installLocal(file)
+    suspend fun installLxNetwork(url: String) = lxManager.installNetwork(url)
+    suspend fun uninstallLx(hash: String) = lxManager.uninstall(hash)
+    fun setActiveLx(hash: String?) = lxManager.setActive(hash)
     /** 切歌时立即终止未完成的插件网络请求，不阻塞调用方 */
     fun cancelPendingRequests() {
         runCatching { runtime.cancelPending() }
@@ -113,6 +141,8 @@ class MusicSourceService(context: Context, private val router: PluginRouter = Pl
     suspend fun resolve(item: MediaItem, quality: MusicQuality) = ensureLoaded().let { router.resolveMedia(item, quality) }
     suspend fun resolveByKey(item: MediaItem, qualityKey: String) = ensureLoaded().let { router.resolveMediaByKey(item, qualityKey) }
     suspend fun resolveForPlayback(item: MediaItem, defaultQualityKey: String) = ensureLoaded().let { router.resolveForPlayback(item, defaultQualityKey) }
-    suspend fun resolveForPlaybackDetailed(item: MediaItem, defaultQualityKey: String, excludeQualities: Set<String> = emptySet(), cascade: Boolean = true, onTrying: ((quality: String, size: Long?) -> Unit)? = null) = ensureLoaded().let { router.resolveForPlaybackDetailed(item, defaultQualityKey, excludeQualities, cascade, onTrying) }
+    suspend fun resolveForPlaybackDetailed(item: MediaItem, defaultQualityKey: String, excludeQualities: Set<String> = emptySet(), cascade: Boolean = true, onTrying: ((quality: String, size: Long?, via: String) -> Unit)? = null) = ensureLoaded().let { router.resolveForPlaybackDetailed(item, defaultQualityKey, excludeQualities, cascade, onTrying) }
+    /** 原生单档直试（跳过 LX，供 Source error 同档回退） */
+    suspend fun resolveNativeDetailed(item: MediaItem, qualityKey: String) = ensureLoaded().let { router.resolveNativeDetailed(item, qualityKey) }
     suspend fun lyrics(item: MediaItem) = ensureLoaded().let { router.lyric(item) }
 }

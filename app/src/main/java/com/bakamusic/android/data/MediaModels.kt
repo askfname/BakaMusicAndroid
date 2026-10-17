@@ -14,9 +14,13 @@ data class NowPlaying(
     /** 是否处于解析中：解析中先显示歌曲信息并叠加加载动画 */
     val loading: Boolean = false,
     /** 备用播放地址：主源 403/断连时自动切换，耗尽才弹失败框 */
-    val backupUrls: List<String> = emptyList()
+    val backupUrls: List<String> = emptyList(),
+    /** 取流来源标注：空=原生插件，非空如 "LX·独家音源" */
+    val via: String = ""
 ) {
     val key: String get() = "${item.platform}:${item.id}"
+    /** 界面展示的音源名：平台 + 取流来源 */
+    val sourceLabel: String get() = "${item.platform}$via"
 }
 
 enum class MusicQuality(val key: String, val label: String) {

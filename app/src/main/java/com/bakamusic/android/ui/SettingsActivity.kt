@@ -10,18 +10,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -56,20 +54,23 @@ class SettingsActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable fun SettingsScreen(embedded: Boolean = false, scrollTrigger: Int = 0) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val manager = remember { PluginManager(context.applicationContext) }
     val repository = remember { AppRepository(context.applicationContext) }
     val scope = rememberCoroutineScope()
+    // 插件配置页显隐：替代旧的列表滚动定位
+    var inPluginPage by rememberSaveable { mutableStateOf(false) }
     val scrollToPlugin = (context as? android.app.Activity)?.intent
         ?.getBooleanExtra(SettingsActivity.EXTRA_SCROLL_TO_PLUGIN, false) == true
-    val listState = rememberLazyListState()
     LaunchedEffect(scrollToPlugin) {
-        if (scrollToPlugin) runCatching { listState.scrollToItem(PLUGIN_GROUP_INDEX) }
+        if (scrollToPlugin) inPluginPage = true
     }
     LaunchedEffect(scrollTrigger) {
-        if (embedded && scrollTrigger > 0) runCatching { listState.animateScrollToItem(PLUGIN_GROUP_INDEX) }
+        if (embedded && scrollTrigger > 0) inPluginPage = true
     }
+    BackHandler(enabled = inPluginPage) { inPluginPage = false }
     var plugins by remember { mutableStateOf(manager.allPlugins()) }
     var subscriptions by remember { mutableStateOf(manager.subscriptions()) }
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
@@ -77,6 +78,16 @@ class SettingsActivity : ComponentActivity() {
     var subscriptionName by rememberSaveable { mutableStateOf("") }
     var subscriptionUrl by rememberSaveable { mutableStateOf("") }
     var networkUrl by rememberSaveable { mutableStateOf("") }
+    var lxNetworkUrl by rememberSaveable { mutableStateOf("") }
+    var lxList by remember { mutableStateOf(emptyList<LxPluginDescriptor>()) }
+    var confirmRemoveLxHash by rememberSaveable { mutableStateOf<String?>(null) }
+    val bakaApp = context.applicationContext as? com.bakamusic.android.BakaApplication
+    LaunchedEffect(bakaApp) {
+        bakaApp ?: return@LaunchedEffect
+        runCatching { bakaApp.sourceService.ensureLxLoaded() }
+        lxList = runCatching { bakaApp.sourceService.installedLx() }.getOrDefault(emptyList()) ?: emptyList()
+    }
+    val lxRefresh = { lxList = runCatching { bakaApp?.sourceService?.installedLx() }.getOrDefault(emptyList()) ?: emptyList() }
     var loading by rememberSaveable { mutableStateOf(false) }
     var confirmRemovePluginId by rememberSaveable { mutableStateOf<String?>(null) }
     var confirmDeleteSubId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -119,6 +130,34 @@ class SettingsActivity : ComponentActivity() {
             notice = result.fold({ "已安装插件：${it.name} ${it.version}" }, { "安装失败：${it.message}" }); refresh()
         }
     }
+    val lxPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val svc = bakaApp?.sourceService
+            val result = runCatching {
+                var name = "lx.js"
+                runCatching {
+                    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (cursor.moveToFirst() && idx >= 0) {
+                            cursor.getString(idx)?.takeIf { it.isNotBlank() }?.let { name = it }
+                        }
+                    }
+                }
+                if (!name.endsWith(".js", true)) name = "$name.js"
+                name = name.substringAfterLast('/').substringAfterLast('\\').ifBlank { "lx.js" }
+                val target = File(context.cacheDir, name)
+                val input = requireNotNull(context.contentResolver.openInputStream(uri)) { "无法读取脚本文件" }
+                input.use { source -> target.outputStream().use { source.copyTo(it) } }
+                try {
+                    requireNotNull(svc) { "播放服务未就绪" }.installLxLocal(target).getOrThrow()
+                } finally {
+                    runCatching { target.delete() }
+                }
+            }
+            notice = result.fold({ "已安装 LX 脚本：${it.name}" }, { "安装失败：${it.message}" }); lxRefresh()
+        }
+    }
     val doDeleteSubscription: (PluginSubscription) -> Unit = { item ->
         manager.removeSubscription(item.id); refresh(); notice = "已删除订阅：${item.name}"
     }
@@ -127,86 +166,116 @@ class SettingsActivity : ComponentActivity() {
             runCatching { MusicSourceService.refreshAll() }
         }
     }
-    Scaffold(
-        contentWindowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets
-    ) { padding ->
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(
-                top = padding.calculateTopPadding() + 18.dp,
-                // 嵌入主页时底座以覆盖层悬浮，需预留空间；独立 Activity 则保持原样
-                bottom = if (embedded) 190.dp else padding.calculateBottomPadding() + 24.dp
-            )
-        ) {
-            item {
-                Text(
-                    "设置",
-                    Modifier.padding(horizontal = 22.dp, vertical = 18.dp),
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
+    // 插件入口摘要：原生启用数 + LX 启用态
+    val enabledPluginCount = plugins.count { it.enabled }
+    val activeLx = lxList.firstOrNull { it.active }
+    val pluginSummary = if (plugins.isEmpty() && lxList.isEmpty()) "未安装插件"
+    else "原生 $enabledPluginCount/${plugins.size} · LX ${activeLx?.name ?: "未启用"}"
+    // 订阅更新/启停/排序回调复用，主页与插件页共用
+    val onUpdateSub: (PluginSubscription) -> Unit = { item ->
+        scope.launch {
+            loading = true; val result = manager.updateSubscription(item); if (result.isSuccess) {
+            runCatching { MusicSourceService.refreshAll() }
+        }; loading = false; notice =
+            result.fold({ "${item.name} 更新完成，导入 ${it.installed} 个插件${it.skippedNotice()}" }, { "更新失败：${it.message ?: "未知错误"}" }); refresh()
+        }
+    }
+    val onTogglePlugin: (InstalledPlugin, Boolean) -> Unit = { item, enabled ->
+        manager.setEnabled(item.id, enabled); refresh(); scope.launch {
+        runCatching { MusicSourceService.refreshAll() }
+    }
+    }
+    val onMovePlugin: (InstalledPlugin, Int) -> Unit = { item, delta ->
+        manager.move(item.id, delta); refresh(); scope.launch {
+        runCatching { MusicSourceService.refreshAll() }
+    }
+    }
+    // LX 开关：互斥单选，关闭则回落原生
+    val onToggleLx: (LxPluginDescriptor, Boolean) -> Unit = { item, enabled ->
+        if (enabled) runCatching { bakaApp?.sourceService?.setActiveLx(item.hash) }
+        else if (item.active) runCatching { bakaApp?.sourceService?.setActiveLx(null) }
+        lxRefresh()
+    }
+    if (inPluginPage) {
+        // 插件配置页：原生插件 + LX 脚本合一
+        PluginConfigPage(
+            embedded = embedded,
+            plugins = plugins,
+            subscriptions = subscriptions,
+            lxList = lxList,
+            loading = loading,
+            onBack = { inPluginPage = false },
+            onInstallLocal = { localPicker.launch(arrayOf("*/*")) },
+            onInstallNetwork = { dialog = "network" },
+            onAddSubscription = { dialog = "subscription" },
+            onUpdate = onUpdateSub,
+            onDeleteSubscription = { item -> confirmDeleteSubId = item.id },
+            onToggle = onTogglePlugin,
+            onRemove = { item -> confirmRemovePluginId = item.id },
+            onMove = onMovePlugin,
+            onInstallLxLocal = { lxPicker.launch(arrayOf("*/*")) },
+            onInstallLxNetwork = { dialog = "lxNetwork" },
+            onToggleLx = onToggleLx,
+            onRemoveLx = { item -> confirmRemoveLxHash = item.hash }
+        )
+    } else {
+        Scaffold(
+            contentWindowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets
+        ) { padding ->
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    top = padding.calculateTopPadding() + 18.dp,
+                    // 嵌入主页时底座以覆盖层悬浮，需预留空间；独立 Activity 则保持原样
+                    bottom = if (embedded) 190.dp else padding.calculateBottomPadding() + 24.dp
                 )
-            }
-            item {
-                SettingGroup("播放") {
-                    SettingRow(
-                        "默认播放音质",
-                        MusicQuality.labelOf(playQuality),
-                        Icons.Default.HighQuality
-                    ) { dialog = "playQuality" }
-                    SettingRow(
-                        "默认下载音质",
-                        MusicQuality.labelOf(downloadQuality),
-                        Icons.Default.Download
-                    ) { dialog = "downloadQuality" }
+            ) {
+                item {
+                    Text(
+                        "设置",
+                        Modifier.padding(horizontal = 22.dp, vertical = 18.dp),
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                 }
-            }
-            item {
-                SettingGroup("下载与文件") {
-                    SettingRow("下载目录", "Music/BakaMusic", Icons.Default.Folder) {}; SettingRow(
-                    "下载后转码",
-                    "关闭",
-                    Icons.Default.Transform
-                ) {}
+                item {
+                    SettingGroup("播放") {
+                        SettingRow(
+                            "默认播放音质",
+                            MusicQuality.labelOf(playQuality),
+                            Icons.Default.HighQuality
+                        ) { dialog = "playQuality" }
+                        SettingRow(
+                            "默认下载音质",
+                            MusicQuality.labelOf(downloadQuality),
+                            Icons.Default.Download
+                        ) { dialog = "downloadQuality" }
+                    }
                 }
-            }
-            item {
-                PluginManagementGroup(
-                    plugins,
-                    subscriptions,
-                    loading,
-                    onInstallLocal = { localPicker.launch(arrayOf("*/*")) },
-                    onInstallNetwork = { dialog = "network" },
-                    onAddSubscription = { dialog = "subscription" },
-                    onUpdate = { item ->
-                        scope.launch {
-                            loading = true; val result = manager.updateSubscription(item); if (result.isSuccess) {
-                            runCatching { MusicSourceService.refreshAll() }
-                        }; loading = false; notice =
-                            result.fold({ "${item.name} 更新完成，导入 ${it.installed} 个插件${it.skippedNotice()}" }, { "更新失败：${it.message ?: "未知错误"}" }); refresh()
-                        }
-                    },
-                    onDeleteSubscription = { item -> confirmDeleteSubId = item.id },
-                    onToggle = { item, enabled ->
-                        manager.setEnabled(item.id, enabled); refresh(); scope.launch {
-                        runCatching { MusicSourceService.refreshAll() }
+                item {
+                    SettingGroup("下载与文件") {
+                        SettingRow("下载目录", "Music/BakaMusic", Icons.Default.Folder) {}; SettingRow(
+                        "下载后转码",
+                        "关闭",
+                        Icons.Default.Transform
+                    ) {}
                     }
-                    },
-                    onRemove = { item -> confirmRemovePluginId = item.id },
-                    onMove = { item, delta ->
-                        manager.move(item.id, delta); refresh(); scope.launch {
-                        runCatching { MusicSourceService.refreshAll() }
+                }
+                item {
+                    // 插件统一入口，点击进配置页
+                    SettingGroup("插件") {
+                        SettingRow("插件管理", pluginSummary, Icons.Default.Extension) { inPluginPage = true }
                     }
-                    })
-            }
-            item {
-                SettingGroup("界面") {
-                    SettingRow("主题颜色", "跟随系统动态取色", Icons.Default.Palette) {}; SettingRow(
-                    "关于 Baka Music",
-                    "v1.0.0",
-                    Icons.Default.Info
-                ) {}
+                }
+                item {
+                    SettingGroup("界面") {
+                        SettingRow("主题颜色", "跟随系统动态取色", Icons.Default.Palette) {}; SettingRow(
+                        "关于 Baka Music",
+                        "v1.0.0",
+                        Icons.Default.Info
+                    ) {}
+                    }
                 }
             }
         }
@@ -216,6 +285,12 @@ class SettingsActivity : ComponentActivity() {
         "downloadQuality" -> QualitySelectDialog("默认下载音质", downloadQuality, { scope.launch { repository.setDownloadQuality(it) }; dialog = null }, { dialog = null })
         "subscription" -> TextInputDialog("添加插件订阅", "订阅名称", subscriptionName, { subscriptionName = it }, "订阅地址（JSON 或 JS）", subscriptionUrl, { subscriptionUrl = it }, "保存", {
             scope.launch { val result = manager.addSubscription(subscriptionName, subscriptionUrl); notice = result.fold({ "订阅已保存：${it.name}" }, { "保存失败：${it.message}" }); if (result.isSuccess) { subscriptionName = ""; subscriptionUrl = ""; dialog = null; refresh() } }
+        }, { dialog = null })
+        "lxNetwork" -> TextInputDialog("网络安装 LX 脚本", "脚本地址（HTTPS 的 JS）", lxNetworkUrl, { lxNetworkUrl = it }, null, "", { _: String -> }, "安装", {
+            val url = lxNetworkUrl
+            lxNetworkUrl = ""
+            dialog = null
+            scope.launch { loading = true; val result = runCatching { requireNotNull(bakaApp?.sourceService) { "播放服务未就绪" }.installLxNetwork(url).getOrThrow() }; loading = false; notice = result.fold({ "安装完成：${it.name}" }, { "安装失败：${it.message ?: "未知错误"}" }); lxRefresh() }
         }, { dialog = null })
         "network" -> TextInputDialog("网络安装插件", "插件地址（JSON 或 JS）", networkUrl, { networkUrl = it }, null, "", { _: String -> }, "安装", {
             // 点击安装后立即隐藏弹窗，后台继续安装
@@ -240,6 +315,26 @@ class SettingsActivity : ComponentActivity() {
             dismissButton = { TextButton(onClick = { confirmRemovePluginId = null }) { Text("取消") } }
         )
     }
+    confirmRemoveLxHash?.let { hash ->
+        val target = lxList.firstOrNull { it.hash == hash }
+        AlertDialog(
+            onDismissRequest = { confirmRemoveLxHash = null },
+            title = { Text("卸载 LX 脚本") },
+            text = { Text("确定卸载“${target?.name ?: ""}”吗？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemoveLxHash = null
+                    scope.launch {
+                        runCatching { bakaApp?.sourceService?.uninstallLx(hash) }
+                        lxRefresh()
+                    }
+                }) {
+                    Text("卸载", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmRemoveLxHash = null }) { Text("取消") } }
+        )
+    }
     confirmDeleteSubId?.let { id ->
         val target = subscriptions.firstOrNull { it.id == id }
         AlertDialog(
@@ -256,8 +351,50 @@ class SettingsActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun PluginConfigPage(
+    embedded: Boolean,
+    plugins: List<InstalledPlugin>,
+    subscriptions: List<PluginSubscription>,
+    lxList: List<LxPluginDescriptor>,
+    loading: Boolean,
+    onBack: () -> Unit,
+    onInstallLocal: () -> Unit,
+    onInstallNetwork: () -> Unit,
+    onAddSubscription: () -> Unit,
+    onUpdate: (PluginSubscription) -> Unit,
+    onDeleteSubscription: (PluginSubscription) -> Unit,
+    onToggle: (InstalledPlugin, Boolean) -> Unit,
+    onRemove: (InstalledPlugin) -> Unit,
+    onMove: (InstalledPlugin, Int) -> Unit,
+    onInstallLxLocal: () -> Unit,
+    onInstallLxNetwork: () -> Unit,
+    onToggleLx: (LxPluginDescriptor, Boolean) -> Unit,
+    onRemoveLx: (LxPluginDescriptor) -> Unit
+) {
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("插件管理") }, navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") } }) },
+        contentWindowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = if (embedded) 190.dp else padding.calculateBottomPadding() + 24.dp
+            )
+        ) {
+            item {
+                PluginManagementGroup(plugins, subscriptions, loading, onInstallLocal, onInstallNetwork, onAddSubscription, onUpdate, onDeleteSubscription, onToggle, onRemove, onMove)
+            }
+            item {
+                LxScriptGroup(lxList, loading, onInstallLxLocal, onInstallLxNetwork, onToggleLx, onRemoveLx)
+            }
+        }
+    }
+}
+
 @Composable private fun PluginManagementGroup(plugins: List<InstalledPlugin>, subscriptions: List<PluginSubscription>, loading: Boolean, onInstallLocal: () -> Unit, onInstallNetwork: () -> Unit, onAddSubscription: () -> Unit, onUpdate: (PluginSubscription) -> Unit, onDeleteSubscription: (PluginSubscription) -> Unit, onToggle: (InstalledPlugin, Boolean) -> Unit, onRemove: (InstalledPlugin) -> Unit, onMove: (InstalledPlugin, Int) -> Unit) {
-    Text("插件管理", Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+    Text("原生插件", Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
     SettingsGroupCard {
             Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Button(onClick = onInstallLocal, enabled = !loading, modifier = Modifier.weight(1f)) { Icon(Icons.Default.FolderOpen, null); Text("本地安装") }; Button(onClick = onInstallNetwork, enabled = !loading, modifier = Modifier.weight(1f)) { if (loading) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text(if (loading) "处理中" else "网络安装") } }
             var installedExpanded by rememberSaveable { mutableStateOf(false) }
@@ -267,6 +404,55 @@ class SettingsActivity : ComponentActivity() {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text("订阅源", Modifier.weight(1f), fontWeight = FontWeight.Bold); TextButton(onClick = onAddSubscription) { Icon(Icons.Default.Add, null); Text("添加订阅") } }
             if (subscriptions.isEmpty()) Text("暂无订阅，点击添加订阅", Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp))
             subscriptions.forEach { item -> ListItem(headlineContent = { Text(item.name) }, supportingContent = { Text(item.url) }, leadingContent = { Icon(Icons.Default.RssFeed, null) }, trailingContent = { Row { IconButton(onClick = { onUpdate(item) }, enabled = !loading) { Icon(Icons.Default.Refresh, "更新订阅") }; IconButton(onClick = { onDeleteSubscription(item) }, enabled = !loading) { Icon(Icons.Default.Delete, "删除订阅") } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent)) }
+    }
+}
+
+/** LX 取流脚本：开关互斥单选，全关则回落原生 */
+@Composable private fun LxScriptGroup(
+    scripts: List<LxPluginDescriptor>,
+    loading: Boolean,
+    onInstallLocal: () -> Unit,
+    onInstallNetwork: () -> Unit,
+    onToggle: (LxPluginDescriptor, Boolean) -> Unit,
+    onRemove: (LxPluginDescriptor) -> Unit
+) {
+    Text("LX 取流脚本", Modifier.padding(start = 22.dp, top = 18.dp, bottom = 6.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+    SettingsGroupCard {
+        val active = scripts.firstOrNull { it.active }
+        Text(
+            if (active != null) "当前启用：${active.name}${if (active.version.isNotBlank()) " ${active.version}" else ""}" else "未启用（各音源走原生插件）",
+            Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp),
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Button(onClick = onInstallLocal, enabled = !loading, modifier = Modifier.weight(1f)) { Icon(Icons.Default.FolderOpen, null); Text("本地安装") }; Button(onClick = onInstallNetwork, enabled = !loading, modifier = Modifier.weight(1f)) { if (loading) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text(if (loading) "处理中" else "网络安装") } }
+        scripts.forEach { item ->
+            key(item.hash) {
+                ListItem(
+                    headlineContent = { Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    supportingContent = {
+                        Text(
+                            listOfNotNull(
+                                item.version.takeIf { it.isNotBlank() },
+                                item.sources.keys.joinToString("/").takeIf { it.isNotBlank() },
+                                item.author.takeIf { it.isNotBlank() }
+                            ).joinToString(" · "),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    trailingContent = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(checked = item.active, onCheckedChange = { onToggle(item, it) })
+                            IconButton(onClick = { onRemove(item) }) { Icon(Icons.Default.Delete, "卸载") }
+                        }
+                    },
+                    modifier = Modifier.clickable(onClick = { onToggle(item, !item.active) }),
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                )
+            }
+        }
+        if (scripts.isEmpty()) Text("暂无 LX 脚本：安装后对应音源优先走 LX 取流", Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -346,9 +532,6 @@ class SettingsActivity : ComponentActivity() {
 @Composable private fun TextInputDialog(title: String, labelOne: String, valueOne: String, onValueOne: (String) -> Unit, labelTwo: String?, valueTwo: String, onValueTwo: (String) -> Unit, confirm: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { OutlinedTextField(valueOne, onValueOne, label = { Text(labelOne) }, singleLine = true); if (labelTwo != null) OutlinedTextField(valueTwo, onValueTwo, label = { Text(labelTwo) }, singleLine = true) } }, confirmButton = { TextButton(onClick = onConfirm, enabled = valueOne.isNotBlank()) { Text(confirm) } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
-
-/** 设置页 LazyColumn 中“插件管理”分组的下标：标题0/播放1/下载2/插件管理3 */
-private const val PLUGIN_GROUP_INDEX = 3
 
 /** 设置页分组卡片容器：使用 surfaceContainerLow，深浅色跟随主题 */
 @Composable private fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {

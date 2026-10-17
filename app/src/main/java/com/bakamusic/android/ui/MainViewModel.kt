@@ -69,6 +69,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var playToken = 0
     private var playRequestJob: Job? = null
+    /** Source error 已排除的音质（按曲目累计，避免同一直播流反复重试已失败的高档） */
+    private val playExcludes = mutableMapOf<String, Set<String>>()
 
     /**
      * 切音质位置保持：新流起播后位置先归零、seek 后才回到原位，
@@ -97,9 +99,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 注册播放控制器监听
         playbackController.addErrorListener { msg ->
             val cur = nowPlaying
-            // 源错误（403/断连等多为单 CDN 边缘故障）：有备用地址时静默切换，不弹框；
-            // 耗尽才走失败弹窗。解码类错误不适用备用源，直接弹框。
-            val isSourceError = msg.contains("Source error") || msg.contains("2001") || msg.contains("2004")
+            // 源错误（403/断连等多为单 CDN 边缘故障）：有备用地址时静默切换，不弹框
+            // 耗尽才走失败弹窗。解码类错误不适用备用源，直接弹框
+            val isSourceError = msg.contains("Source error") || msg.contains("2001") || msg.contains("2004") || msg.contains("3003")
             val next = if (cur != null && isSourceError) {
                 cur.backupUrls.firstOrNull { it.startsWith("http", true) && it != cur.mediaUrl }
             } else null
@@ -118,12 +120,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 return@addErrorListener
             }
+            // Source error 且无备用地址时自动降档重试，耗尽才弹框
+            if (cur != null && isSourceError && !cur.loading) {
+                val key = cur.key
+                val failed = cur.qualityKey
+                // LX 直链失败时先同档直试原生（同档 URL 不同源，原生可能可用），避免误降档
+                // 原生失败或本来就是原生失败时再按全局顺序降档
+                if (cur.via.contains("LX")) {
+                    android.util.Log.w("BakaPlayer", "LX 播放失败同档直试原生: $key $failed ($msg)")
+                    nowPlaying = cur.copy(loading = true, via = "")
+                    viewModelScope.launch {
+                        val token = ++playToken
+                        playRequestJob?.cancel()
+                        val native = runCatching {
+                            withContext(Dispatchers.IO) { sourceService.resolveNativeDetailed(cur.item, failed) }
+                        }.getOrNull()
+                        if (token != playToken) return@launch
+                        if (native != null) {
+                            val (res, q, via) = native
+                            val url = res.mediaUrl?.takeIf { it.startsWith("http", true) }
+                            if (url != null) {
+                                android.util.Log.w("BakaPlayer", "LX 失败回退原生同档命中: $key $failed->$q")
+                                playExcludes.remove(key)
+                                val displayItem = res.copy(mediaUrl = null, mediaHeaders = emptyMap())
+                                val backups = res.backupUrls.filter { it != url }
+                                val np = NowPlaying(displayItem, url, q, res.qualities[q]?.size, res.mediaHeaders, loading = false, backupUrls = backups, via = via)
+                                resolvedCache[key] = np
+                                nowPlaying = np
+                                runCatching { playbackController.play(np.item.copy(mediaUrl = url, mediaHeaders = res.mediaHeaders)) }
+                                    .onFailure {
+                                        if (token != playToken) return@launch
+                                        playerError = "播放失败：${it.message}"
+                                        playerErrorRetry = false
+                                        nowPlaying?.let { if (it.key == key) nowPlaying = it.copy(loading = false) }
+                                    }
+                                return@launch
+                            }
+                        }
+                        // 原生同档亦无可用时转入常规降档（排除已失败档）
+                        val acc = (playExcludes[key] ?: emptySet()) + failed
+                        playExcludes[key] = acc
+                        val lower = nextLowerOrdered(failed, acc)
+                        if (lower != null) {
+                            android.util.Log.w("BakaPlayer", "原生同档无果，降档重试: $key $failed->$lower")
+                            playbackController.clear()
+                            startTrack(cur.item, queueIndex, acc)
+                        } else {
+                            playerError = msg
+                            playerErrorRetry = false
+                            nowPlaying?.let { if (it.key == key && it.loading) nowPlaying = it.copy(loading = false) }
+                        }
+                    }
+                    return@addErrorListener
+                }
+                val acc = (playExcludes[key] ?: emptySet()) + failed
+                playExcludes[key] = acc
+                // 按全局顺序降档（LX 声明集常大于原生 qualities，不能仅看已声明）
+                val lower = nextLowerOrdered(failed, acc)
+                // 有更低档且未耗尽时静默重播，不弹框（loading 期会先显示 LX/原生 trying 名）
+                if (lower != null) {
+                    android.util.Log.w("BakaPlayer", "播放失败自动降档重试: $key $failed->$lower ($msg)")
+                    // 清旧流避免残留回调干扰新一轮 loading（startTrack 内亦会 clear，此处去重避免闪烁放慢）
+                    startTrack(cur.item, queueIndex, acc)
+                    return@addErrorListener
+                }
+            }
             playerError = msg
             playerErrorRetry = false
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
         }
         playbackController.addAudibleListener {
             nowPlaying?.let { if (it.loading) nowPlaying = it.copy(loading = false) }
+            // 起播成功即清该曲目的降档记忆，下次重播仍从高档试起
+            nowPlaying?.let { playExcludes.remove(it.key) }
         }
         // 播放完毕事件驱动切歌（主线程回调）：后台低频轮询下也能及时进下一首
         playbackController.addEndedListener { handleTrackEnded() }
@@ -301,11 +370,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 
                 val resPair = try {
                     val r = withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
-                        sourceService.resolveForPlaybackDetailed(item, defaultPlayQuality, excludeQualities) { trying, tryingSize ->
-                            // 自动逐级重试时界面实时跟随当前尝试档
+                        sourceService.resolveForPlaybackDetailed(item, defaultPlayQuality, excludeQualities) { trying, tryingSize, tryingVia ->
+                            // 自动逐级重试时界面实时跟随当前尝试档（含 LX 插件名，不论最终成败先行展示）
                             if (token == playToken) {
                                 nowPlaying?.takeIf { it.key == key && it.loading }?.let {
-                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size)
+                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size, via = tryingVia)
                                 }
                             }
                         }
@@ -328,7 +397,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     null
                 } ?: return@withContext null
                 
-                val (res, actualQuality) = resPair
+                val (res, actualQuality, via) = resPair
                 val url = res.mediaUrl?.takeIf { it.startsWith("http", true) }
                     ?: run {
                         if (token == playToken) {
@@ -341,7 +410,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // res 由详情补全后的条目拷贝而来，展示与缓存均用它
                 val displayItem = res.copy(mediaUrl = null, mediaHeaders = emptyMap())
                 val backups = res.backupUrls.filter { it != url }
-                NowPlaying(displayItem, url, actualQuality, res.qualities[actualQuality]?.size, res.mediaHeaders, loading = false, backupUrls = backups).also {
+                NowPlaying(displayItem, url, actualQuality, res.qualities[actualQuality]?.size, res.mediaHeaders, loading = false, backupUrls = backups, via = via).also {
                     resolvedCache[key] = it
                 }
             }
@@ -427,6 +496,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .firstOrNull { item.qualities.containsKey(it) }
     }
 
+    /** Source error 自动降档用：按全局顺序取下一低档（不要求已声明，LX 声明集常大于原生 qualities） */
+    private fun nextLowerOrdered(fromKey: String, exclude: Set<String> = emptySet()): String? {
+        val idx = QUALITY_KEYS_ORDERED.indexOf(fromKey)
+        if (idx < 0) return null
+        return QUALITY_KEYS_ORDERED.subList(0, idx).reversed().firstOrNull { !exclude.contains(it) }
+    }
+
     /** 手动切音质失败后的单步降级：只低一档，不自动级联 */
     fun retryLowerQuality() {
         val cur = nowPlaying ?: return
@@ -470,10 +546,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val pair = try {
                 withContext(Dispatchers.IO) {
                     withTimeout(PLAY_RESOLVE_TIMEOUT_MS) {
-                        sourceService.resolveForPlaybackDetailed(item, newKey, cascade = false) { trying, tryingSize ->
+                        sourceService.resolveForPlaybackDetailed(item, newKey, cascade = false) { trying, tryingSize, tryingVia ->
                             if (token == playToken) {
                                 nowPlaying?.takeIf { it.key == itemKey && it.loading }?.let {
-                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size)
+                                    nowPlaying = it.copy(qualityKey = trying, size = tryingSize ?: it.size, via = tryingVia)
                                 }
                             }
                         }
@@ -498,7 +574,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            val (res, q) = pair
+            val (res, q, via) = pair
             val url = res.mediaUrl?.takeIf { it.startsWith("http", true) }
                 ?: run {
                     if (token != playToken) return@launch
@@ -509,7 +585,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
             if (token != playToken) return@launch
-            val np = NowPlaying(res.copy(mediaUrl = null, mediaHeaders = emptyMap()), url, q, res.qualities[q]?.size, res.mediaHeaders, loading = false, backupUrls = res.backupUrls.filter { it != url })
+            val np = NowPlaying(res.copy(mediaUrl = null, mediaHeaders = emptyMap()), url, q, res.qualities[q]?.size, res.mediaHeaders, loading = false, backupUrls = res.backupUrls.filter { it != url }, via = via)
             if (resolvedCacheGen == sourceService.dataVersion()) {
                 resolvedCache[itemKey] = np
             }

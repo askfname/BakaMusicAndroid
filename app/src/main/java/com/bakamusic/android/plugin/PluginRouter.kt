@@ -5,8 +5,10 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 
-/** 按音源优先级路由插件调用，已禁用与未注册的插件永不被调用。 */
+/** 按音源优先级路由插件调用，已禁用与未注册的插件永不被调用 */
 class PluginRouter(private val manager: PluginManager) {
+    /** LX 取流解析器：已配置时具权威性 */
+    var lxResolver: LxResolver? = null
     private val adapters = linkedMapOf<String, MusicPlugin>()
 
     fun register(plugin: InstalledPlugin, adapter: MusicPlugin) {
@@ -37,8 +39,8 @@ class PluginRouter(private val manager: PluginManager) {
     }
 
     /**
-     * 搜索项 qualities 为空时用 getMusicInfo 补全，
-     * 先补全详情再解析；补全失败则回退用原条目直接解析，不阻塞播放。
+     * 搜索项 qualities 为空时用 getMusicInfo 补全
+     * 先补全详情再解析；补全失败则回退用原条目直接解析，不阻塞播放
      */
     private suspend fun maybeEnrich(plugin: MusicPlugin, item: MediaItem): MediaItem {
         if (item.qualities.isNotEmpty()) return item
@@ -46,7 +48,7 @@ class PluginRouter(private val manager: PluginManager) {
         return if (enriched.qualities.isNotEmpty()) enriched else item
     }
 
-    /** 替换全量映射，调用方需保证串行调用。 */
+    /** 替换全量映射，调用方需保证串行调用 */
     fun replaceAll(entries: List<Pair<InstalledPlugin, MusicPlugin>>) {
         adapters.clear()
         entries.forEach { (meta, adapter) ->
@@ -85,7 +87,7 @@ class PluginRouter(private val manager: PluginManager) {
         return SearchPage(emptyList())
     }
 
-    /** 指定平台榜单分组：无适配器或插件未实现时返回空列表。 */
+    /** 指定平台榜单分组：无适配器或插件未实现时返回空列表 */
     suspend fun topLists(platform: String): List<TopListGroup> {
         val plugin = resolveAdapter(platform) ?: return emptyList()
         return try {
@@ -137,14 +139,41 @@ class PluginRouter(private val manager: PluginManager) {
                 return null
             }
         val current = maybeEnrich(plugin, item)
+        lxResolver?.let { lx ->
+            when (val o = lx.resolveDetailed(current, qualityKey)) {
+                is LxOutcome.Resolved -> return o.media
+                // LX 失败则回退原生插件，权威语义仍优先 LX（命中即返回），仅在失败时继续走 JS
+                is LxOutcome.Failed -> Log.d("BakaPlugin", "[LX] 回退原生插件 ${current.platform}:${current.id}")
+                LxOutcome.Unsupported -> {}
+            }
+        }
         val tried = playbackQualityOrder(current, qualityKey)
         for (q in tried) {
             val res = resolveOne(plugin, current, q)
             if (res?.mediaUrl?.startsWith("http", true) == true) return res
         }
         // 后备：使用 qualities 自带的 url
+        return qualitiesUrlFallback(current, qualityKey)
+    }
+
+    /** qualities 自带的直链后备 */
+    private fun qualitiesUrlFallback(item: MediaItem, qualityKey: String): MediaItem? =
+        item.qualities[qualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
+            item.copy(mediaUrl = it)
+        }
+
+    /** 原生单档直试（跳过 LX）：Source error 来自 LX 非音频 URL 时，同档原生 URL 不同源，需优先直试而非直接降档 */
+    suspend fun resolveNativeDetailed(item: MediaItem, qualityKey: String): Triple<MediaItem, String, String>? {
+        val plugin = findAdapterByPlatform(item.platform) ?: return null
+        val current = maybeEnrich(plugin, item)
+        val res = resolveOneDetailed(plugin, current, qualityKey)
+        if (res?.first?.mediaUrl?.startsWith("http", true) == true) {
+            val (media, actual) = res
+            Log.d("BakaPlugin", "解析命中 ${current.platform}:${current.id} quality=$actual(requested=$qualityKey) via ${plugin.platform}(native-retry)")
+            return Triple(media, actual, "")
+        }
         current.qualities[qualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
-            return current.copy(mediaUrl = it)
+            return Triple(current.copy(mediaUrl = it), qualityKey, "")
         }
         return null
     }
@@ -154,36 +183,49 @@ class PluginRouter(private val manager: PluginManager) {
         return resolveMediaByKey(item, defaultQualityKey)
     }
 
-    /** 供播放调用（返回实际命中的音质键，供播放栏显示），仅请求当前平台 */
+    /** 供播放调用（返回实际命中音质与取流来源标注，供播放栏显示），仅请求当前平台 */
     suspend fun resolveForPlaybackDetailed(
         item: MediaItem,
         defaultQualityKey: String,
         excludeQualities: Set<String> = emptySet(),
         cascade: Boolean = true,
-        onTrying: ((quality: String, size: Long?) -> Unit)? = null
-    ): Pair<MediaItem, String>? {
+        onTrying: ((quality: String, size: Long?, via: String) -> Unit)? = null
+    ): Triple<MediaItem, String, String>? {
         val plugin = findAdapterByPlatform(item.platform)
             ?: run {
                 Log.d("BakaPlugin", "无当前平台适配器，拒绝解析: ${item.platform}:${item.id}")
                 return null
             }
         val current = maybeEnrich(plugin, item)
+        lxResolver?.let { lx ->
+            when (val o = lx.resolveDetailed(current, defaultQualityKey, excludeQualities, cascade, onTrying)) {
+                is LxOutcome.Resolved -> {
+                    Log.d("BakaPlugin", "解析命中 ${current.platform}:${current.id} quality=${o.quality}(lx) via ${plugin.platform}")
+                    return Triple(o.media, o.quality, o.via)
+                }
+                // LX 失败则回退原生插件，仅记录后继续走 JS 档位循环
+                is LxOutcome.Failed -> {
+                    Log.d("BakaPlugin", "[LX] 回退原生插件 ${current.platform}:${current.id} tried=lx excluded=$excludeQualities")
+                }
+                LxOutcome.Unsupported -> {}
+            }
+        }
         // 手动切音质只试所选单档，不自动级联
         val tried = if (cascade) playbackQualityOrder(current, defaultQualityKey) else listOf(defaultQualityKey)
         for (q in tried) {
             if (excludeQualities.contains(q)) continue
-            // 上报当前尝试档，供界面实时跟随
-            onTrying?.invoke(q, current.qualities[q]?.size)
+            // 上报当前尝试档，供界面实时跟随；原生档 via 置空（与 LX 档区分显示）
+            onTrying?.invoke(q, current.qualities[q]?.size, "")
             val res = resolveOneDetailed(plugin, current, q)
             if (res?.first?.mediaUrl?.startsWith("http", true) == true) {
                 val (media, actual) = res
                 Log.d("BakaPlugin", "解析命中 ${current.platform}:${current.id} quality=$actual(requested=$q) via ${plugin.platform}")
-                return media to actual
+                return Triple(media, actual, "")
             }
         }
         if (!excludeQualities.contains(defaultQualityKey)) {
             current.qualities[defaultQualityKey]?.url?.takeIf { it.startsWith("http", true) }?.let {
-                return current.copy(mediaUrl = it) to defaultQualityKey
+                return Triple(current.copy(mediaUrl = it), defaultQualityKey, "")
             }
         }
         Log.d("BakaPlugin", "解析失败 ${current.platform}:${current.id} tried=$tried excluded=$excludeQualities")

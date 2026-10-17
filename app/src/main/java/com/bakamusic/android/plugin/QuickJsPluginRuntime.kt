@@ -32,7 +32,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.Semaphore
 import org.json.JSONTokener
 
-private fun isPluginPrivateHost(host: String): Boolean {
+internal fun isPluginPrivateHost(host: String): Boolean {
     if (host == "localhost" || host == "0.0.0.0" || host.endsWith(".localhost")) return true
     return runCatching {
         InetAddress.getAllByName(host).any { address ->
@@ -43,7 +43,7 @@ private fun isPluginPrivateHost(host: String): Boolean {
     }.getOrDefault(true)
 }
 
-private fun readLimited(input: java.io.InputStream, limit: Int): ByteArray {
+internal fun readLimited(input: java.io.InputStream, limit: Int): ByteArray {
     val output = java.io.ByteArrayOutputStream(minOf(limit, 64 * 1024))
     val buffer = ByteArray(8192)
     var total = 0
@@ -57,7 +57,7 @@ private fun readLimited(input: java.io.InputStream, limit: Int): ByteArray {
     return output.toByteArray()
 }
 
-/** 基于 QuickJS 的 MusicPlugin 实现：所有 JS 调用均在专用单线程上执行。 */
+/** 基于 QuickJS 的 MusicPlugin 实现：所有 JS 调用均在专用单线程上执行 */
 class QuickJsPluginRuntime(private val manager: PluginManager) {
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "BakaQuickJs").apply { isDaemon = true }
@@ -252,165 +252,6 @@ function getTopListDetail(topListItem) {"""
             )
         }
 
-        /**
-         * 剥离 async/await 为同步调用。跳过字符串/模板文本/注释与正则字面量，
-         * `obj.await` 形式的属性访问会被保留。
-         */
-        private fun stripAsyncAwait(source: String): String {
-            val out = StringBuilder(source.length)
-            val stack = ArrayDeque<Int>()
-            val exprDepths = ArrayDeque<Int>()
-            var state = 0 // 0=code 1=lineComment 2=blockComment 3=sq 4=dq 5=template 6=expr
-            var exprDepth = 0
-            var lastCode = '\u0000'
-            var lastWord = ""
-            var i = 0
-            val n = source.length
-            // 判断 `/` 后可跟正则的场景：上一个有效字符为表达式起始符或特定关键字
-            val regexKeywords = setOf(
-                "return", "typeof", "instanceof", "in", "of", "new", "delete",
-                "void", "throw", "case", "do", "else", "yield", "await"
-            )
-            fun isId(c: Char) = c.isLetterOrDigit() || c == '_' || c == '$'
-            fun push(s: Int) { stack.addLast(s) }
-            fun pop(): Int { state = if (stack.isEmpty()) 0 else stack.removeLast(); return state }
-            while (i < n) {
-                val c = source[i]
-                when (state) {
-                    1 -> {
-                        out.append(c); i++
-                        if (c == '\n') pop()
-                    }
-                    2 -> {
-                        if (c == '*' && i + 1 < n && source[i + 1] == '/') { out.append("*/"); i += 2; pop() }
-                        else { out.append(c); i++ }
-                    }
-                    3, 4 -> {
-                        val q = if (state == 3) '\'' else '"'
-                        if (c == '\\' && i + 1 < n) { out.append(c).append(source[i + 1]); i += 2 }
-                        else { out.append(c); i++; if (c == q) pop() }
-                    }
-                    5 -> {
-                        if (c == '\\' && i + 1 < n) { out.append(c).append(source[i + 1]); i += 2 }
-                        else if (c == '`') { out.append(c); i++; pop() }
-                        else if (c == '$' && i + 1 < n && source[i + 1] == '{') {
-                            out.append("\${"); i += 2; push(5); exprDepths.addLast(exprDepth); exprDepth = 1; state = 6
-                        } else { out.append(c); i++ }
-                    }
-                    0, 6 -> {
-                        if (c == '/' && i + 1 < n && source[i + 1] == '/') { out.append("//"); i += 2; push(state); state = 1; continue }
-                        if (c == '/' && i + 1 < n && source[i + 1] == '*') { out.append("/*"); i += 2; push(state); state = 2; continue }
-                        if (c == '\'') { out.append(c); i++; push(state); state = 3; continue }
-                        if (c == '"') { out.append(c); i++; push(state); state = 4; continue }
-                        if (c == '`') { out.append(c); i++; push(state); state = 5; continue }
-                        if (c == '/' && (i + 1 >= n || (source[i + 1] != '/' && source[i + 1] != '*'))) {
-                            // 区分正则字面量与除法，避免错误进入字符串状态
-                            val regexAllowed = lastCode == '\u0000' ||
-                                lastCode in "([{,;:!&|?+-*%=<>^~>" ||
-                                lastWord in regexKeywords
-                            if (regexAllowed) {
-                                out.append(c); i++
-                                var inClass = false
-                                var terminated = false
-                                while (i < n) {
-                                    val r = source[i]
-                                    out.append(r)
-                                    if (r == '\\' && i + 1 < n) { out.append(source[i + 1]); i += 2; continue }
-                                    if (r == '\n') break
-                                    if (r == '[') inClass = true
-                                    else if (r == ']') inClass = false
-                                    else if (r == '/' && !inClass) { i++; terminated = true; break }
-                                    i++
-                                }
-                                if (terminated) {
-                                    while (i < n && source[i].isLetter()) { out.append(source[i]); i++ }
-                                }
-                                lastCode = 'x'; lastWord = ""
-                                continue
-                            }
-                            out.append(c); lastCode = c; lastWord = ""; i++; continue
-                        }
-                        if (state == 6) {
-                            if (c == '{') exprDepth++
-                            if (c == '}') {
-                                exprDepth--
-                                if (exprDepth == 0) {
-                                    out.append(c); i++; lastCode = c
-                                    exprDepth = if (exprDepths.isEmpty()) 0 else exprDepths.removeLast()
-                                    pop(); continue
-                                }
-                            }
-                        }
-                        if (isId(c)) {
-                            var j = i
-                            while (j < n && isId(source[j])) j++
-                            val word = source.substring(i, j)
-                            if (word == "async" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
-                                var k = j
-                                while (k < n && source[k].isWhitespace()) k++
-                                val nextIsParen = k < n && source[k] == '('
-                                // async 字符串方法名（如 async "search"()）
-                                val nextIsQuotedName = k < n && (source[k] == '"' || source[k] == '\'' || source[k] == '`')
-                                var nextWord = ""
-                                var m = k
-                                if (!nextIsParen && !nextIsQuotedName) { while (m < n && isId(source[m])) m++; nextWord = source.substring(k, m) }
-                                var p = m
-                                while (p < n && source[p].isWhitespace()) p++
-                                val identFollowedByParen = nextWord.isNotEmpty() && nextWord != "function" && p < n && source[p] == '('
-                                // async 箭头函数同样剥离 async
-                                val arrowAfterIdent = nextWord.isNotEmpty() && nextWord != "function" &&
-                                    (source.startsWith("=>", p) || runCatching {
-                                        var q = p
-                                        if (q < n && source[q] == '?') q++
-                                        source.startsWith("=>", q)
-                                    }.getOrDefault(false))
-                                val arrowAfterParen = nextIsParen && runCatching {
-                                    var depth = 0; var q = k
-                                    while (q < n) {
-                                        val ch = source[q]
-                                        if (ch == '(') depth++
-                                        else if (ch == ')') { depth--; if (depth == 0) { q++; break } }
-                                        else if (ch == '\'' || ch == '"' || ch == '`') break
-                                        q++
-                                    }
-                                    while (q < n && source[q].isWhitespace()) q++
-                                    source.startsWith("=>", q)
-                                }.getOrDefault(false)
-                                if (nextIsParen || nextIsQuotedName || nextWord == "function" || identFollowedByParen ||
-                                    arrowAfterIdent || arrowAfterParen) {
-                                    i = k; continue
-                                }
-                            }
-                            if (word == "await" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
-                                var k2 = j
-                                while (k2 < n && source[k2].isWhitespace()) k2++
-                                i = k2; continue
-                            }
-                            // for await 剥离为 for
-                            if (word == "for" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
-                                var k3 = j
-                                while (k3 < n && source[k3].isWhitespace()) k3++
-                                if (source.startsWith("await", k3) && (k3 + 5 >= n || !isId(source[k3 + 5]))) {
-                                    var k4 = k3 + 5
-                                    while (k4 < n && source[k4].isWhitespace()) k4++
-                                    if (k4 < n && source[k4] == '(') {
-                                        out.append(word); out.append(' ')
-                                        lastCode = 'r'; lastWord = word
-                                        i = k4; continue
-                                    }
-                                }
-                            }
-                            out.append(word)
-                            for (t in i until j) if (!source[t].isWhitespace()) lastCode = source[t]
-                            lastWord = word
-                            i = j; continue
-                        }
-                        out.append(c); if (!c.isWhitespace()) lastCode = c; i++
-                    }
-                }
-            }
-            return out.toString()
-        }
 
         /** 参数安全的 console 桥接：直接接收原始参数并逐个安全格式化，避免 JNI 回调异常导致崩溃。 */
         private fun installConsoleBridge() {
@@ -537,8 +378,8 @@ function getTopListDetail(topListItem) {"""
             )
         }
 
-        /** 单次播放解析超时，超时抛出 MediaResolveTimeoutException */
-        private val mediaSourceTimeoutMs = 20_000L
+        /** 单次播放解析超时 30s：多供应商插件需留足预算，超时抛出 MediaResolveTimeoutException */
+        private val mediaSourceTimeoutMs = 30_000L
         /** 详情补全超时：最佳努力，超时返回 null 并直接走播放解析 */
         private val musicInfoTimeoutMs = 10_000L
         /** 未完成的播放解析任务：新请求到来时取消旧任务，避免单线程排队阻塞 */
@@ -600,41 +441,79 @@ function getTopListDetail(topListItem) {"""
         private suspend fun resolveMediaSource(item: MediaItem, quality: String): Pair<MediaItem, String>? {
             preemptMediaCalls()
             val payload = itemJson(item)
-            var value = try {
-                invoke("getMediaSource", payload, quality, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
-            } catch (e: TimeoutCancellationException) {
-                throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
-            }
-            // 旧插件仅认识 low/standard/high/super：新音质键无结果时按桌面端映射回退一次
-            if (value.optString("url").isBlank()) {
-                val legacy = legacyQualityOf(quality)
-                if (legacy != null && legacy != quality) {
-                    value = try {
-                        invoke("getMediaSource", payload, legacy, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
-                    } catch (e: TimeoutCancellationException) {
-                        throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
+            // JS 插件尝试（含旧音质回退），取消/超时/实例过期直接上抛
+            // 其它 JS 异常吞掉走原生兜底（在线更新覆盖插件文件后仍可用）
+            var value: JSONObject? = null
+            try {
+                var v = invoke("getMediaSource", payload, quality, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
+                // 旧插件仅认识 low/standard/high/super：新音质键无结果时按桌面端映射回退一次
+                if (v.optString("url").isBlank()) {
+                    val legacy = legacyQualityOf(quality)
+                    if (legacy != null && legacy != quality) {
+                        v = try {
+                            invoke("getMediaSource", payload, legacy, timeoutMs = mediaSourceTimeoutMs, trackMedia = true)
+                        } catch (e: TimeoutCancellationException) {
+                            throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: StalePluginException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            // 非 QQ 保持原行为：上抛由路由延时重试；QQ 则保留旧值走原生兜底
+                            if (!isQqPlatform(platformName)) throw e
+                            Log.w("BakaPlugin", "$platformName.getMediaSource 旧音质回退失败: ${e.message}")
+                            v
+                        }
                     }
                 }
+                value = v
+            } catch (e: TimeoutCancellationException) {
+                throw MediaResolveTimeoutException("播放请求超时(${mediaSourceTimeoutMs}ms): ${item.platform}:${item.id} $quality")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: StalePluginException) {
+                throw e
+            } catch (e: Throwable) {
+                // 非 QQ 保持原行为：上抛由路由延时重试一次；QQ 则转原生兜底
+                if (!isQqPlatform(platformName)) throw e
+                Log.w("BakaPlugin", "$platformName.getMediaSource JS 失败，转原生兜底: ${e.message}")
             }
-            val url = value.optString("url").takeIf { it.startsWith("http", true) } ?: return null
+            var url = value?.optString("url")?.takeIf { it.startsWith("http", true) }
+            // QQ 原生兜底：不依赖插件文件内容，在线更新覆盖后依然有效
+            if (url == null && isQqPlatform(platformName)) {
+                url = try {
+                    qqDirectMediaUrl(item, payload, quality)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Log.w("BakaPlugin", "$platformName.getMediaSource 原生兜底异常: ${e.message}")
+                    null
+                }
+                if (url != null) {
+                    Log.d("BakaPlugin", "$platformName.getMediaSource 原生兜底命中: quality=$quality")
+                    value = JSONObject().put("url", url)
+                }
+            }
+            if (url == null) return null
+            val result = value ?: return null
             // 当前客户端无法解密加密流（cek/ekey），返回 null，由路由继续尝试更低音质
-            if (value.has("cek") && value.optString("cek").isNotBlank()) {
+            if (result.has("cek") && result.optString("cek").isNotBlank()) {
                 Log.d("BakaPlugin", "$platformName.getMediaSource 加密流跳过(cek): quality=$quality")
                 return null
             }
-            if (value.has("ekey") && value.optString("ekey").isNotBlank()) {
+            if (result.has("ekey") && result.optString("ekey").isNotBlank()) {
                 Log.d("BakaPlugin", "$platformName.getMediaSource 加密流跳过(ekey): quality=$quality")
                 return null
             }
             val headers = mutableMapOf<String, String>()
-            value.optJSONObject("headers")?.let { obj ->
+            result.optJSONObject("headers")?.let { obj ->
                 obj.keys().forEach { key -> obj.optString(key).takeIf(String::isNotBlank)?.let { headers[key] = it } }
             }
-            value.optString("userAgent").takeIf(String::isNotBlank)?.let { headers.putIfAbsent("User-Agent", it) }
+            result.optString("userAgent").takeIf(String::isNotBlank)?.let { headers.putIfAbsent("User-Agent", it) }
             // 插件可能降级返回（如 bilibili 请求 flac 实际命中 320k）：以上报为准，避免界面音质与实际流不一致
-            val actualQuality = value.optString("quality").trim().takeIf { it.isNotEmpty() } ?: quality
+            val actualQuality = result.optString("quality").trim().takeIf { it.isNotEmpty() } ?: quality
             // 本次解析返回的备用 CDN 随条目透出，播放失败时自动切换
-            val backups = parseBackupUrls(value).ifEmpty { item.backupUrls }
+            val backups = parseBackupUrls(result).ifEmpty { item.backupUrls }
             return item.copy(mediaUrl = url, mediaHeaders = headers, backupUrls = backups) to actualQuality
         }
 
@@ -1352,208 +1231,6 @@ function getTopListDetail(topListItem) {"""
                 modules[name] ?: "module.exports={};"
         }
 
-        /** 同步运行时兼容实现：提供同步 Promise、任意值的 then/catch、同步 setTimeout，与 stripAsyncAwait 配套使用。 */
-        private fun runtimeBootstrap(): String = """
-            var __root = this;
-            function setTimeout(fn){ try { if (typeof fn === 'function') fn(); } catch (e) {} return 0; }
-            function clearTimeout(id) {}
-            function setInterval(fn){ return 0; }
-            function clearInterval(id) {}
-            __root.setTimeout = setTimeout;
-            __root.clearTimeout = clearTimeout;
-            __root.setInterval = setInterval;
-            __root.clearInterval = clearInterval;
-            function __BakaRejected(err){ this.__baka_error = err; }
-            __BakaRejected.prototype.then = function(onF, onR){
-              if (typeof onR === 'function') {
-                try { var r = onR(this.__baka_error); return (r instanceof __BakaRejected) ? r : r; }
-                catch (e2) { return new __BakaRejected(e2); }
-              }
-              return this;
-            };
-            __BakaRejected.prototype.catch = function(onR){ return this.then(undefined, onR); };
-            Object.defineProperty(Object.prototype, 'then', {configurable: true, writable: true, enumerable: false, value: function(onF, onR){
-              try {
-                var r = (typeof onF === 'function') ? onF(this) : this;
-                return (r instanceof __BakaRejected) ? r : r;
-              } catch (e) {
-                if (typeof onR === 'function') {
-                  try { var r2 = onR(e); return (r2 instanceof __BakaRejected) ? r2 : r2; }
-                  catch (e2) { return new __BakaRejected(e2); }
-                }
-                return new __BakaRejected(e);
-              }
-            }});
-            Object.defineProperty(Object.prototype, 'catch', {configurable: true, writable: true, enumerable: false, value: function(onR){ return this; }});
-            function Promise(executor){
-              var self = this;
-              self._v = undefined;
-              function resolve(v){ self._v = (v instanceof Promise) ? v._v : v; }
-              function reject(e){ self._v = new __BakaRejected(e); }
-              try { executor(resolve, reject); } catch (e) { reject(e); }
-            }
-            Promise.resolve = function(v){ return (v instanceof Promise) ? v._v : v; };
-            Promise.reject = function(e){ return new __BakaRejected(e); };
-            Promise.all = function(values){
-              var out = []; var list = values || [];
-              for (var i = 0; i < list.length; i++) {
-                var v = list[i];
-                if (v instanceof Promise) v = v._v;
-                if (v instanceof __BakaRejected) throw v.__baka_error;
-                out.push(v);
-              }
-              return out;
-            };
-            Promise.race = function(values){
-              var list = values || [];
-              for (var i = 0; i < list.length; i++) {
-                var v = list[i];
-                if (v instanceof Promise) v = v._v;
-                if (!(v instanceof __BakaRejected)) return v;
-              }
-              if (list.length) { var last = list[list.length - 1]; return (last instanceof Promise) ? last._v : last; }
-              return undefined;
-            };
-            Promise.allSettled = function(values){
-              var out = []; var list = values || [];
-              for (var i = 0; i < list.length; i++) {
-                var v = list[i];
-                if (v instanceof Promise) v = v._v;
-                if (v instanceof __BakaRejected) out.push({status: 'rejected', reason: v.__baka_error});
-                else out.push({status: 'fulfilled', value: v});
-              }
-              return out;
-            };
-            globalThis.Promise = Promise;
-            function HashValue(value, enc){ this.value = String(value); this.enc = enc || null; }
-            HashValue.prototype.toString = function(fmt){
-              if (fmt === CryptoJs.enc.Hex) {
-                if (this.enc === 'hex') return this.value;
-                if (this.enc === 'base64') return __bakaBinToHex(atob(this.value));
-                return __bakaBinToHex(__bakaUtf8Encode(this.value));
-              }
-              if (fmt === CryptoJs.enc.Base64) {
-                if (this.enc === 'base64') return this.value;
-                if (this.enc === 'hex') return btoa(__bakaHexToBin(this.value));
-                return btoa(__bakaUtf8Encode(this.value));
-              }
-              if (fmt === CryptoJs.enc.Utf8) {
-                if (this.enc === 'base64') return __bakaUtf8Decode(atob(this.value));
-                if (this.enc === 'hex') return __bakaUtf8Decode(__bakaHexToBin(this.value));
-                return this.value;
-              }
-              return this.value;
-            };
-            function hash(name, value){ return new HashValue(BakaHttp[name](String(value)), 'hex'); }
-            var CryptoJs = {};
-            CryptoJs.MD5 = function(value){ return hash('md5', value); };
-            CryptoJs.SHA1 = function(value){ return hash('sha1', value); };
-            CryptoJs.SHA256 = function(value){ return hash('sha256', value); };
-            CryptoJs.SHA512 = function(value){ return hash('sha512', value); };
-            CryptoJs.HmacSHA256 = function(value, key){ return new HashValue(BakaHttp.hmacSha256(String(key), String(value)), 'hex'); };
-            CryptoJs.HmacSHA1 = function(value, key){ return new HashValue(BakaHttp.hmacSha1(String(key), String(value)), 'hex'); };
-            CryptoJs.HmacMD5 = function(value, key){ return new HashValue(BakaHttp.hmacMd5(String(key), String(value)), 'hex'); };
-            CryptoJs.enc = {
-              Utf8: {parse: function(value){ return new HashValue(value, 'utf8'); }, stringify: function(value){ return String(value.value || value); }},
-              Hex: {parse: function(value){ return new HashValue(value, 'hex'); }, stringify: function(value){ return String(value.value || value); }},
-              Base64: {parse: function(value){ return new HashValue(__bakaUtf8Decode(atob(String(value))), 'utf8'); }, stringify: function(value){ return String(value.value || value); }}
-            };
-            CryptoJs.mode = {ECB: {name: 'ECB'}, CBC: {name: 'CBC'}};
-            CryptoJs.pad = {Pkcs7: {}};
-            CryptoJs.AES = {encrypt: function(value, key, config){
-              var mode = config && config.mode && config.mode.name ? config.mode.name : 'CBC';
-              var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
-              var cipher = new HashValue(BakaHttp.aes(mode, String(key.value || key), iv, String(value.value || value)), 'base64');
-              return {ciphertext: cipher, toString: function(){ return cipher.toString(); }};
-            }, decrypt: function(cipher, key, config){
-              var mode = config && config.mode && config.mode.name ? config.mode.name : 'CBC';
-              var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
-              var ctext = (cipher && cipher.ciphertext) ? String(cipher.ciphertext.value || cipher.ciphertext) : String(cipher);
-              var plain = BakaHttp.aesDecrypt(mode, String(key.value || key), iv, ctext);
-              return {toString: function(fmt){ if (fmt === CryptoJs.enc.Utf8 || fmt === undefined) return plain; if (fmt === CryptoJs.enc.Hex) return __bakaBinToHex(__bakaUtf8Encode(plain)); if (fmt === CryptoJs.enc.Base64) return btoa(__bakaUtf8Encode(plain)); return plain; }};
-            }};
-            function atob(value){
-              var table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-              var input = String(value).replace(/=+$/, ''); var output = ''; var buffer = 0; var bits = 0;
-              for (var i = 0; i < input.length; i++) { var n = table.indexOf(input.charAt(i)); if (n < 0) continue; buffer = (buffer << 6) | n; bits += 6; if (bits >= 8) { bits -= 8; output += String.fromCharCode((buffer >> bits) & 255); } }
-              return output;
-            }
-            function btoa(value){
-              var table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='; var output = '';
-              for (var i = 0; i < value.length; i += 3) { var a = value.charCodeAt(i), b = value.charCodeAt(i + 1), c = value.charCodeAt(i + 2); var n = (a << 16) | ((isNaN(b) ? 0 : b) << 8) | (isNaN(c) ? 0 : c); output += table[(n >> 18) & 63] + table[(n >> 12) & 63] + (isNaN(b) ? '=' : table[(n >> 6) & 63]) + (isNaN(c) ? '=' : table[n & 63]); }
-              return output;
-            }
-            function __bakaUtf8Encode(s){ return unescape(encodeURIComponent(String(s))); }
-            function __bakaUtf8Decode(bin){ try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; } }
-            function __bakaHexToBin(hex){ var h = String(hex).replace(/^0x/i, ''); if (h.length % 2) h = '0' + h; var out = ''; for (var i = 0; i < h.length; i += 2) out += String.fromCharCode(parseInt(h.substr(i, 2), 16)); return out; }
-            function __bakaBinToHex(bin){ var out = ''; for (var i = 0; i < bin.length; i++) { var h = bin.charCodeAt(i).toString(16); out += (h.length < 2 ? '0' : '') + h; } return out; }
-            function makeBuffer(value){
-              value.toString = function(encoding){
-                var bin = ''; for (var i = 0; i < value.length; i++) bin += String.fromCharCode(value[i]);
-                if (encoding === 'base64') return btoa(bin);
-                if (encoding === 'hex') return __bakaBinToHex(bin);
-                return __bakaUtf8Decode(bin);
-              };
-              var _slice = value.slice, _sub = value.subarray;
-              value.slice = function(s, e){ return makeBuffer(_slice.call(value, s, e)); };
-              value.subarray = function(s, e){ return makeBuffer(_sub.call(value, s, e)); };
-              return value;
-            }
-            var Buffer = {};
-            Buffer.from = function(value, encoding){
-              if (typeof value === 'string') {
-                var enc = String(encoding || 'utf8').toLowerCase();
-                var bin = enc === 'base64' ? atob(value) : enc === 'hex' ? __bakaHexToBin(value) : __bakaUtf8Encode(value);
-                var bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 255; return makeBuffer(bytes);
-              }
-              if (value instanceof Uint8Array) { var c = new Uint8Array(value.length); c.set(value); return makeBuffer(c); }
-              var arr = new Uint8Array((value && value.length) || 0); for (var j = 0; j < arr.length; j++) arr[j] = (value[j] || 0) & 255; return makeBuffer(arr);
-            };
-            Buffer.alloc = function(size, fill){ var a = new Uint8Array(size || 0); if (fill) a.fill(typeof fill === 'number' ? fill : 0); return makeBuffer(a); };
-            Buffer.concat = function(list){ var size = 0; for (var i = 0; i < list.length; i++) size += list[i].length; var result = new Uint8Array(size); var offset = 0; for (var j = 0; j < list.length; j++) { result.set(list[j], offset); offset += list[j].length; } return makeBuffer(result); };
-            Buffer.isBuffer = function(value){ return value instanceof Uint8Array; };
-            Buffer.byteLength = function(s){ return __bakaUtf8Encode(s).length; };
-            globalThis.Buffer = Buffer; globalThis.atob = atob; globalThis.btoa = btoa;
-            function TextEncoder(){ this.encode = function(value){ var bin = __bakaUtf8Encode(value); var out = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return makeBuffer(out); }; }
-            function TextDecoder(label){
-              var enc = String(label || 'utf-8').toLowerCase();
-              this.decode = function(value){
-                if (!value) return '';
-                if (typeof value === 'string') return value;
-                var bin = ''; for (var i = 0; i < value.length; i++) bin += String.fromCharCode(value[i]);
-                if (enc === 'utf-8' || enc === 'utf8') return __bakaUtf8Decode(bin);
-                try { return BakaHttp.textDecode(btoa(bin), enc); } catch (e) { return __bakaUtf8Decode(bin); }
-              };
-            }
-            globalThis.TextEncoder = TextEncoder; globalThis.TextDecoder = TextDecoder;
-            function URL(value){
-              var self = this;
-              self.href = String(value);
-              self.protocol = (self.href.match(/^https?:/i) || [''])[0];
-              self.hostname = (self.href.match(/^https?:\/\/([^/:?#]+)/i) || ['', ''])[1];
-              self.host = self.hostname;
-              Object.defineProperty(self, 'pathname', {configurable: true, enumerable: true,
-                get: function(){ return (self.href.match(/^https?:\/\/[^/]+([^?#]*)/i) || ['', '/'])[1]; },
-                set: function(p){ self.href = self.href.replace(/^((?:https?:)?\/\/[^/?#]+)[^?#]*/, function(m, o){ return o + p; }); }
-              });
-              self.searchParams = {set: function(key, val){
-                var part = encodeURIComponent(key) + '=' + encodeURIComponent(val);
-                self.href += (self.href.indexOf('?') >= 0 ? '&' : '?') + part;
-              }, get: function(key){
-                try { var m = self.href.match(/[?&]([^#]*)/); if (!m) return null; var pairs = m[1].split('&'); for (var i = 0; i < pairs.length; i++) { var kv = pairs[i].split('='); if (decodeURIComponent(kv[0]) === String(key)) return kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=')) : ''; } } catch (e) {}
-                return null;
-              }, append: function(key, val){ this.set(key, val); }};
-              Object.defineProperty(self, 'search', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/\?([^#]*)/); return m ? ('?' + m[1]) : ''; }});
-              Object.defineProperty(self, 'origin', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/^(https?:\/\/[^/?#]+)/i); return m ? m[1] : ''; }});
-              self.toString = function(){ return self.href; };
-            }
-            globalThis.URL = URL; globalThis.CryptoJS = CryptoJs; globalThis.CryptoJs = CryptoJs;
-            // 补齐桌面端透传的 env/process 全局，缺失会导致 ReferenceError
-            try {
-              if (typeof process === 'undefined') { globalThis.process = {platform: 'android', version: '1.0.0', env: {}}; }
-              if (typeof env === 'undefined') { globalThis.env = {}; }
-            } catch (e) {}
-        """.trimIndent()
 
         private fun moduleScripts(): Map<String, String> = mapOf(
             "axios" to """
@@ -1756,3 +1433,439 @@ function getTopListDetail(topListItem) {"""
         )
     }
 }
+
+/** QuickJS 同步运行时共享件：音乐插件与 LX 脚本宿主共用 */
+        /**
+         * 剥离 async/await 为同步调用。跳过字符串/模板文本/注释与正则字面量，
+         * `obj.await` 形式的属性访问会被保留
+         */
+        internal fun stripAsyncAwait(source: String): String {
+            val out = StringBuilder(source.length)
+            val stack = ArrayDeque<Int>()
+            val exprDepths = ArrayDeque<Int>()
+            var state = 0 // 0=code 1=lineComment 2=blockComment 3=sq 4=dq 5=template 6=expr
+            var exprDepth = 0
+            var lastCode = '\u0000'
+            var lastWord = ""
+            var i = 0
+            val n = source.length
+            // 判断 `/` 后可跟正则的场景：上一个有效字符为表达式起始符或特定关键字
+            val regexKeywords = setOf(
+                "return", "typeof", "instanceof", "in", "of", "new", "delete",
+                "void", "throw", "case", "do", "else", "yield", "await"
+            )
+            fun isId(c: Char) = c.isLetterOrDigit() || c == '_' || c == '$'
+            fun push(s: Int) { stack.addLast(s) }
+            fun pop(): Int { state = if (stack.isEmpty()) 0 else stack.removeLast(); return state }
+            while (i < n) {
+                val c = source[i]
+                when (state) {
+                    1 -> {
+                        out.append(c); i++
+                        if (c == '\n') pop()
+                    }
+                    2 -> {
+                        if (c == '*' && i + 1 < n && source[i + 1] == '/') { out.append("*/"); i += 2; pop() }
+                        else { out.append(c); i++ }
+                    }
+                    3, 4 -> {
+                        val q = if (state == 3) '\'' else '"'
+                        if (c == '\\' && i + 1 < n) { out.append(c).append(source[i + 1]); i += 2 }
+                        else { out.append(c); i++; if (c == q) pop() }
+                    }
+                    5 -> {
+                        if (c == '\\' && i + 1 < n) { out.append(c).append(source[i + 1]); i += 2 }
+                        else if (c == '`') { out.append(c); i++; pop() }
+                        else if (c == '$' && i + 1 < n && source[i + 1] == '{') {
+                            out.append("\${"); i += 2; push(5); exprDepths.addLast(exprDepth); exprDepth = 1; state = 6
+                        } else { out.append(c); i++ }
+                    }
+                    0, 6 -> {
+                        if (c == '/' && i + 1 < n && source[i + 1] == '/') { out.append("//"); i += 2; push(state); state = 1; continue }
+                        if (c == '/' && i + 1 < n && source[i + 1] == '*') { out.append("/*"); i += 2; push(state); state = 2; continue }
+                        if (c == '\'') { out.append(c); i++; push(state); state = 3; continue }
+                        if (c == '"') { out.append(c); i++; push(state); state = 4; continue }
+                        if (c == '`') { out.append(c); i++; push(state); state = 5; continue }
+                        if (c == '/' && (i + 1 >= n || (source[i + 1] != '/' && source[i + 1] != '*'))) {
+                            // 区分正则字面量与除法，避免错误进入字符串状态
+                            val regexAllowed = lastCode == '\u0000' ||
+                                lastCode in "([{,;:!&|?+-*%=<>^~>" ||
+                                lastWord in regexKeywords
+                            if (regexAllowed) {
+                                out.append(c); i++
+                                var inClass = false
+                                var terminated = false
+                                while (i < n) {
+                                    val r = source[i]
+                                    out.append(r)
+                                    if (r == '\\' && i + 1 < n) { out.append(source[i + 1]); i += 2; continue }
+                                    if (r == '\n') break
+                                    if (r == '[') inClass = true
+                                    else if (r == ']') inClass = false
+                                    else if (r == '/' && !inClass) { i++; terminated = true; break }
+                                    i++
+                                }
+                                if (terminated) {
+                                    while (i < n && source[i].isLetter()) { out.append(source[i]); i++ }
+                                }
+                                lastCode = 'x'; lastWord = ""
+                                continue
+                            }
+                            out.append(c); lastCode = c; lastWord = ""; i++; continue
+                        }
+                        if (state == 6) {
+                            if (c == '{') exprDepth++
+                            if (c == '}') {
+                                exprDepth--
+                                if (exprDepth == 0) {
+                                    out.append(c); i++; lastCode = c
+                                    exprDepth = if (exprDepths.isEmpty()) 0 else exprDepths.removeLast()
+                                    pop(); continue
+                                }
+                            }
+                        }
+                        if (isId(c)) {
+                            var j = i
+                            while (j < n && isId(source[j])) j++
+                            val word = source.substring(i, j)
+                            if (word == "async" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
+                                var k = j
+                                while (k < n && source[k].isWhitespace()) k++
+                                val nextIsParen = k < n && source[k] == '('
+                                // async 字符串方法名（如 async "search"()）
+                                val nextIsQuotedName = k < n && (source[k] == '"' || source[k] == '\'' || source[k] == '`')
+                                var nextWord = ""
+                                var m = k
+                                if (!nextIsParen && !nextIsQuotedName) { while (m < n && isId(source[m])) m++; nextWord = source.substring(k, m) }
+                                var p = m
+                                while (p < n && source[p].isWhitespace()) p++
+                                val identFollowedByParen = nextWord.isNotEmpty() && nextWord != "function" && p < n && source[p] == '('
+                                // async 箭头函数同样剥离 async
+                                val arrowAfterIdent = nextWord.isNotEmpty() && nextWord != "function" &&
+                                    (source.startsWith("=>", p) || runCatching {
+                                        var q = p
+                                        if (q < n && source[q] == '?') q++
+                                        source.startsWith("=>", q)
+                                    }.getOrDefault(false))
+                                val arrowAfterParen = nextIsParen && runCatching {
+                                    var depth = 0; var q = k
+                                    while (q < n) {
+                                        val ch = source[q]
+                                        if (ch == '(') depth++
+                                        else if (ch == ')') { depth--; if (depth == 0) { q++; break } }
+                                        else if (ch == '\'' || ch == '"' || ch == '`') break
+                                        q++
+                                    }
+                                    while (q < n && source[q].isWhitespace()) q++
+                                    source.startsWith("=>", q)
+                                }.getOrDefault(false)
+                                if (nextIsParen || nextIsQuotedName || nextWord == "function" || identFollowedByParen ||
+                                    arrowAfterIdent || arrowAfterParen) {
+                                    i = k; continue
+                                }
+                            }
+                            if (word == "await" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
+                                var k2 = j
+                                while (k2 < n && source[k2].isWhitespace()) k2++
+                                i = k2; continue
+                            }
+                            // for await 剥离为 for
+                            if (word == "for" && (i == 0 || !isId(source[i - 1])) && lastCode != '.') {
+                                var k3 = j
+                                while (k3 < n && source[k3].isWhitespace()) k3++
+                                if (source.startsWith("await", k3) && (k3 + 5 >= n || !isId(source[k3 + 5]))) {
+                                    var k4 = k3 + 5
+                                    while (k4 < n && source[k4].isWhitespace()) k4++
+                                    if (k4 < n && source[k4] == '(') {
+                                        out.append(word); out.append(' ')
+                                        lastCode = 'r'; lastWord = word
+                                        i = k4; continue
+                                    }
+                                }
+                            }
+                            out.append(word)
+                            for (t in i until j) if (!source[t].isWhitespace()) lastCode = source[t]
+                            lastWord = word
+                            i = j; continue
+                        }
+                        out.append(c); if (!c.isWhitespace()) lastCode = c; i++
+                    }
+                }
+            }
+            return out.toString()
+        }
+
+        /** 同步运行时兼容实现：提供同步 Promise、任意值的 then/catch、同步 setTimeout，与 stripAsyncAwait 配套使用 */
+        internal fun runtimeBootstrap(): String = """
+            var __root = this;
+            function setTimeout(fn){ try { if (typeof fn === 'function') fn(); } catch (e) {} return 0; }
+            function clearTimeout(id) {}
+            function setInterval(fn){ return 0; }
+            function clearInterval(id) {}
+            __root.setTimeout = setTimeout;
+            __root.clearTimeout = clearTimeout;
+            __root.setInterval = setInterval;
+            __root.clearInterval = clearInterval;
+            function __BakaRejected(err){ this.__baka_error = err; }
+            // 空结果占位：链式 .then/.catch 不因 undefined 中断（真 Promise 语义近似）
+            var __bakaVoid = {};
+            __bakaVoid.then = function(){ return __bakaVoid; };
+            __bakaVoid.catch = function(){ return __bakaVoid; };
+            function __bakaWrap(r){ return (r === undefined || r === null) ? __bakaVoid : r; }
+            function __bakaUnwrap(v){ var g = 0; while ((v instanceof Promise) && g++ < 8) v = v._v; return v; }
+            __BakaRejected.prototype.then = function(onF, onR){
+              if (typeof onR === 'function') {
+                try { return __bakaWrap(onR(this.__baka_error)); }
+                catch (e2) { return new __BakaRejected(e2); }
+              }
+              return this;
+            };
+            __BakaRejected.prototype.catch = function(onR){ return this.then(undefined, onR); };
+            Object.defineProperty(Object.prototype, 'then', {configurable: true, writable: true, enumerable: false, value: function(onF, onR){
+              var self = __bakaUnwrap(this);
+              // 同步垫片：字符串等基元调用 .then 时 this 会被装箱为 String/Number/Boolean 对象，
+              // 若直接透传会导致 typeof 变为 object（如 validateUrl 误判），此处拆箱回基元
+              try {
+                if (self instanceof String || self instanceof Number || self instanceof Boolean) self = self.valueOf();
+              } catch (e0) {}
+              if (self instanceof __BakaRejected) {
+                if (typeof onR === 'function') {
+                  try { return __bakaWrap(onR(self.__baka_error)); }
+                  catch (e2) { return new __BakaRejected(e2); }
+                }
+                return self;
+              }
+              try { return __bakaWrap((typeof onF === 'function') ? onF(self) : self); }
+              catch (e) {
+                if (typeof onR === 'function') {
+                  try { return __bakaWrap(onR(e)); }
+                  catch (e2) { return new __BakaRejected(e2); }
+                }
+                return new __BakaRejected(e);
+              }
+            }});
+            Object.defineProperty(Object.prototype, 'catch', {configurable: true, writable: true, enumerable: false, value: function(onR){ return this.then(undefined, onR); }});
+            // 同步垫片必须提供 finally，否则安装期直接 TypeError 中断，inited 永不发送
+            // finally 回调无参执行，抛错则转为 rejected，否则透传原值/原拒绝态
+            Object.defineProperty(Object.prototype, 'finally', {configurable: true, writable: true, enumerable: false, value: function(onF){
+              try { if (typeof onF === 'function') onF(); } catch (e) { return new __BakaRejected(e); }
+              return this;
+            }});
+            function Promise(executor){
+              var self = this;
+              self._v = undefined;
+              function resolve(v){ self._v = (v instanceof Promise) ? v._v : v; }
+              function reject(e){ self._v = new __BakaRejected(e); }
+              try { executor(resolve, reject); } catch (e) { reject(e); }
+              // 同步垫片：await 被剥离后 `const res = httpRequest(...)` 直接拿到 Promise，
+              // 而原生语义应拿到 resolved 值。经 Proxy 将未知属性透传到 _v（如 res.body/statusCode），
+              // 原生 `then/catch/finally/_v/__baka_error` 优先走自身，避免透传破坏链式语义
+              if (typeof Proxy !== 'undefined') {
+                try {
+                  return new Proxy(self, {
+                    get: function(t, p, r){
+                      if (p in t) return t[p];
+                      var v = t._v;
+                      if (v !== null && typeof v === 'object' && !(v instanceof __BakaRejected) && v !== __bakaVoid) {
+                        if (p in Object(v)) return v[p];
+                      }
+                      return undefined;
+                    }
+                  });
+                } catch (e2) {}
+              }
+            }
+            Promise.resolve = function(v){ return (v instanceof Promise) ? v._v : v; };
+            Promise.reject = function(e){ return new __BakaRejected(e); };
+            Promise.all = function(values){
+              var out = []; var list = values || [];
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (v instanceof __BakaRejected) throw v.__baka_error;
+                out.push(v);
+              }
+              return out;
+            };
+            Promise.race = function(values){
+              var list = values || [];
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (!(v instanceof __BakaRejected)) return v;
+              }
+              if (list.length) { var last = list[list.length - 1]; return (last instanceof Promise) ? last._v : last; }
+              return undefined;
+            };
+            Promise.allSettled = function(values){
+              var out = []; var list = values || [];
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (v instanceof __BakaRejected) out.push({status: 'rejected', reason: v.__baka_error});
+                else out.push({status: 'fulfilled', value: v});
+              }
+              return out;
+            };
+            // 剥离 async 后 handler.fn 抛同步异常会导致原生 map 直接抛错、中断 allSettled 与后续顺序回退
+            //（原生 async 下只会返回 rejected Promise），此处仅对处理器链特征数组按元素捕获转 rejected，
+            // 普通数据 map 仍走原生抛错语义，避免误吞业务异常
+            try {
+              var __origMap = Array.prototype.map;
+              Array.prototype.map = function(fn, thisArg){
+                try {
+                  if (this != null && this.length > 0 && this.length <= 10) {
+                    var f0 = this[0];
+                    if (f0 != null && typeof f0 === 'object' && typeof f0.fn === 'function') {
+                      var o = new Array(this.length);
+                      for (var mi=0; mi<this.length; mi++){
+                        try { o[mi] = fn.call(thisArg, this[mi], mi, this); }
+                        catch(me){ o[mi] = Promise.reject(me); }
+                      }
+                      return o;
+                    }
+                  }
+                } catch(e2){}
+                return __origMap.call(this, fn, thisArg);
+              };
+            } catch(eMap){}
+            Promise.any = function(values){
+              var list = values || []; var firstErr = null; var seen = false;
+              for (var i = 0; i < list.length; i++) {
+                var v = list[i];
+                if (v instanceof Promise) v = v._v;
+                if (v instanceof __BakaRejected) { if (!seen) { firstErr = v.__baka_error; seen = true; } continue; }
+                return v;
+              }
+              throw seen ? firstErr : new Error('All promises were rejected');
+            };
+            globalThis.Promise = Promise;
+            function HashValue(value, enc){ this.value = String(value); this.enc = enc || null; }
+            HashValue.prototype.toString = function(fmt){
+              if (fmt === CryptoJs.enc.Hex) {
+                if (this.enc === 'hex') return this.value;
+                if (this.enc === 'base64') return __bakaBinToHex(atob(this.value));
+                return __bakaBinToHex(__bakaUtf8Encode(this.value));
+              }
+              if (fmt === CryptoJs.enc.Base64) {
+                if (this.enc === 'base64') return this.value;
+                if (this.enc === 'hex') return btoa(__bakaHexToBin(this.value));
+                return btoa(__bakaUtf8Encode(this.value));
+              }
+              if (fmt === CryptoJs.enc.Utf8) {
+                if (this.enc === 'base64') return __bakaUtf8Decode(atob(this.value));
+                if (this.enc === 'hex') return __bakaUtf8Decode(__bakaHexToBin(this.value));
+                return this.value;
+              }
+              return this.value;
+            };
+            function hash(name, value){ return new HashValue(BakaHttp[name](String(value)), 'hex'); }
+            var CryptoJs = {};
+            CryptoJs.MD5 = function(value){ return hash('md5', value); };
+            CryptoJs.SHA1 = function(value){ return hash('sha1', value); };
+            CryptoJs.SHA256 = function(value){ return hash('sha256', value); };
+            CryptoJs.SHA512 = function(value){ return hash('sha512', value); };
+            CryptoJs.HmacSHA256 = function(value, key){ return new HashValue(BakaHttp.hmacSha256(String(key), String(value)), 'hex'); };
+            CryptoJs.HmacSHA1 = function(value, key){ return new HashValue(BakaHttp.hmacSha1(String(key), String(value)), 'hex'); };
+            CryptoJs.HmacMD5 = function(value, key){ return new HashValue(BakaHttp.hmacMd5(String(key), String(value)), 'hex'); };
+            CryptoJs.enc = {
+              Utf8: {parse: function(value){ return new HashValue(value, 'utf8'); }, stringify: function(value){ return String(value.value || value); }},
+              Hex: {parse: function(value){ return new HashValue(value, 'hex'); }, stringify: function(value){ return String(value.value || value); }},
+              Base64: {parse: function(value){ return new HashValue(__bakaUtf8Decode(atob(String(value))), 'utf8'); }, stringify: function(value){ return String(value.value || value); }}
+            };
+            CryptoJs.mode = {ECB: {name: 'ECB'}, CBC: {name: 'CBC'}};
+            CryptoJs.pad = {Pkcs7: {}};
+            CryptoJs.AES = {encrypt: function(value, key, config){
+              var mode = config && config.mode && config.mode.name ? config.mode.name : 'CBC';
+              var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
+              var cipher = new HashValue(BakaHttp.aes(mode, String(key.value || key), iv, String(value.value || value)), 'base64');
+              return {ciphertext: cipher, toString: function(){ return cipher.toString(); }};
+            }, decrypt: function(cipher, key, config){
+              var mode = config && config.mode && config.mode.name ? config.mode.name : 'CBC';
+              var iv = config && config.iv ? String(config.iv.value || config.iv) : '';
+              var ctext = (cipher && cipher.ciphertext) ? String(cipher.ciphertext.value || cipher.ciphertext) : String(cipher);
+              var plain = BakaHttp.aesDecrypt(mode, String(key.value || key), iv, ctext);
+              return {toString: function(fmt){ if (fmt === CryptoJs.enc.Utf8 || fmt === undefined) return plain; if (fmt === CryptoJs.enc.Hex) return __bakaBinToHex(__bakaUtf8Encode(plain)); if (fmt === CryptoJs.enc.Base64) return btoa(__bakaUtf8Encode(plain)); return plain; }};
+            }};
+            function atob(value){
+              var table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+              var input = String(value).replace(/=+$/, ''); var output = ''; var buffer = 0; var bits = 0;
+              for (var i = 0; i < input.length; i++) { var n = table.indexOf(input.charAt(i)); if (n < 0) continue; buffer = (buffer << 6) | n; bits += 6; if (bits >= 8) { bits -= 8; output += String.fromCharCode((buffer >> bits) & 255); } }
+              return output;
+            }
+            function btoa(value){
+              var table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='; var output = '';
+              for (var i = 0; i < value.length; i += 3) { var a = value.charCodeAt(i), b = value.charCodeAt(i + 1), c = value.charCodeAt(i + 2); var n = (a << 16) | ((isNaN(b) ? 0 : b) << 8) | (isNaN(c) ? 0 : c); output += table[(n >> 18) & 63] + table[(n >> 12) & 63] + (isNaN(b) ? '=' : table[(n >> 6) & 63]) + (isNaN(c) ? '=' : table[n & 63]); }
+              return output;
+            }
+            function __bakaUtf8Encode(s){ return unescape(encodeURIComponent(String(s))); }
+            function __bakaUtf8Decode(bin){ try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; } }
+            function __bakaHexToBin(hex){ var h = String(hex).replace(/^0x/i, ''); if (h.length % 2) h = '0' + h; var out = ''; for (var i = 0; i < h.length; i += 2) out += String.fromCharCode(parseInt(h.substr(i, 2), 16)); return out; }
+            function __bakaBinToHex(bin){ var out = ''; for (var i = 0; i < bin.length; i++) { var h = bin.charCodeAt(i).toString(16); out += (h.length < 2 ? '0' : '') + h; } return out; }
+            function makeBuffer(value){
+              value.toString = function(encoding){
+                var bin = ''; for (var i = 0; i < value.length; i++) bin += String.fromCharCode(value[i]);
+                if (encoding === 'base64') return btoa(bin);
+                if (encoding === 'hex') return __bakaBinToHex(bin);
+                return __bakaUtf8Decode(bin);
+              };
+              var _slice = value.slice, _sub = value.subarray;
+              value.slice = function(s, e){ return makeBuffer(_slice.call(value, s, e)); };
+              value.subarray = function(s, e){ return makeBuffer(_sub.call(value, s, e)); };
+              return value;
+            }
+            var Buffer = {};
+            Buffer.from = function(value, encoding){
+              if (typeof value === 'string') {
+                var enc = String(encoding || 'utf8').toLowerCase();
+                var bin = enc === 'base64' ? atob(value) : enc === 'hex' ? __bakaHexToBin(value) : __bakaUtf8Encode(value);
+                var bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 255; return makeBuffer(bytes);
+              }
+              if (value instanceof Uint8Array) { var c = new Uint8Array(value.length); c.set(value); return makeBuffer(c); }
+              var arr = new Uint8Array((value && value.length) || 0); for (var j = 0; j < arr.length; j++) arr[j] = (value[j] || 0) & 255; return makeBuffer(arr);
+            };
+            Buffer.alloc = function(size, fill){ var a = new Uint8Array(size || 0); if (fill) a.fill(typeof fill === 'number' ? fill : 0); return makeBuffer(a); };
+            Buffer.concat = function(list){ var size = 0; for (var i = 0; i < list.length; i++) size += list[i].length; var result = new Uint8Array(size); var offset = 0; for (var j = 0; j < list.length; j++) { result.set(list[j], offset); offset += list[j].length; } return makeBuffer(result); };
+            Buffer.isBuffer = function(value){ return value instanceof Uint8Array; };
+            Buffer.byteLength = function(s){ return __bakaUtf8Encode(s).length; };
+            globalThis.Buffer = Buffer; globalThis.atob = atob; globalThis.btoa = btoa;
+            function TextEncoder(){ this.encode = function(value){ var bin = __bakaUtf8Encode(value); var out = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return makeBuffer(out); }; }
+            function TextDecoder(label){
+              var enc = String(label || 'utf-8').toLowerCase();
+              this.decode = function(value){
+                if (!value) return '';
+                if (typeof value === 'string') return value;
+                var bin = ''; for (var i = 0; i < value.length; i++) bin += String.fromCharCode(value[i]);
+                if (enc === 'utf-8' || enc === 'utf8') return __bakaUtf8Decode(bin);
+                try { return BakaHttp.textDecode(btoa(bin), enc); } catch (e) { return __bakaUtf8Decode(bin); }
+              };
+            }
+            globalThis.TextEncoder = TextEncoder; globalThis.TextDecoder = TextDecoder;
+            function URL(value){
+              var self = this;
+              self.href = String(value);
+              self.protocol = (self.href.match(/^https?:/i) || [''])[0];
+              self.hostname = (self.href.match(/^https?:\/\/([^/:?#]+)/i) || ['', ''])[1];
+              self.host = self.hostname;
+              Object.defineProperty(self, 'pathname', {configurable: true, enumerable: true,
+                get: function(){ return (self.href.match(/^https?:\/\/[^/]+([^?#]*)/i) || ['', '/'])[1]; },
+                set: function(p){ self.href = self.href.replace(/^((?:https?:)?\/\/[^/?#]+)[^?#]*/, function(m, o){ return o + p; }); }
+              });
+              self.searchParams = {set: function(key, val){
+                var part = encodeURIComponent(key) + '=' + encodeURIComponent(val);
+                self.href += (self.href.indexOf('?') >= 0 ? '&' : '?') + part;
+              }, get: function(key){
+                try { var m = self.href.match(/[?&]([^#]*)/); if (!m) return null; var pairs = m[1].split('&'); for (var i = 0; i < pairs.length; i++) { var kv = pairs[i].split('='); if (decodeURIComponent(kv[0]) === String(key)) return kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=')) : ''; } } catch (e) {}
+                return null;
+              }, append: function(key, val){ this.set(key, val); }};
+              Object.defineProperty(self, 'search', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/\?([^#]*)/); return m ? ('?' + m[1]) : ''; }});
+              Object.defineProperty(self, 'origin', {configurable: true, enumerable: true, get: function(){ var m = self.href.match(/^(https?:\/\/[^/?#]+)/i); return m ? m[1] : ''; }});
+              self.toString = function(){ return self.href; };
+            }
+            globalThis.URL = URL; globalThis.CryptoJS = CryptoJs; globalThis.CryptoJs = CryptoJs;
+            // 补齐透传的 env/process 全局，缺失会导致 ReferenceError
+            try {
+              if (typeof process === 'undefined') { globalThis.process = {platform: 'android', version: '1.0.0', env: {}}; }
+              if (typeof env === 'undefined') { globalThis.env = {}; }
+            } catch (e) {}
+        """.trimIndent()
